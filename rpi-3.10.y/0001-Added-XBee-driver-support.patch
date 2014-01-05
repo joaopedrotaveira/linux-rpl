@@ -1,0 +1,4597 @@
+From 6358907fdaf926ac6e975390358e29cabf325e0e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jo=C3=A3o=20Pedro=20Taveira?= <joao.p.taveira@gmail.com>
+Date: Sun, 5 Jan 2014 16:12:15 +0000
+Subject: [PATCH 1/3] Added XBee driver support
+
+---
+ drivers/net/ieee802154/Kconfig  |    4 +
+ drivers/net/ieee802154/Makefile |    1 +
+ drivers/net/ieee802154/xbee.c   | 4539 +++++++++++++++++++++++++++++++++++++++
+ include/uapi/linux/tty.h        |    1 +
+ 4 files changed, 4545 insertions(+)
+ create mode 100644 drivers/net/ieee802154/xbee.c
+
+diff --git a/drivers/net/ieee802154/Kconfig b/drivers/net/ieee802154/Kconfig
+index 08ae465..acc8eb8 100644
+--- a/drivers/net/ieee802154/Kconfig
++++ b/drivers/net/ieee802154/Kconfig
+@@ -30,6 +30,10 @@ config IEEE802154_FAKELB
+ 	  This driver can also be built as a module. To do so say M here.
+ 	  The module will be called 'fakelb'.
+ 
++config IEEE802154_XBEE
++	depends on IEEE802154_DRIVERS && MAC802154
++	tristate "Xbee UART driver"
++
+ config IEEE802154_AT86RF230
+         depends on IEEE802154_DRIVERS && MAC802154
+         tristate "AT86RF230/231 transceiver driver"
+diff --git a/drivers/net/ieee802154/Makefile b/drivers/net/ieee802154/Makefile
+index abb0c08..72899e3 100644
+--- a/drivers/net/ieee802154/Makefile
++++ b/drivers/net/ieee802154/Makefile
+@@ -1,4 +1,5 @@
+ obj-$(CONFIG_IEEE802154_FAKEHARD) += fakehard.o
+ obj-$(CONFIG_IEEE802154_FAKELB) += fakelb.o
++obj-$(CONFIG_IEEE802154_XBEE) += xbee.o
+ obj-$(CONFIG_IEEE802154_AT86RF230) += at86rf230.o
+ obj-$(CONFIG_IEEE802154_MRF24J40) += mrf24j40.o
+diff --git a/drivers/net/ieee802154/xbee.c b/drivers/net/ieee802154/xbee.c
+new file mode 100644
+index 0000000..ec349fd
+--- /dev/null
++++ b/drivers/net/ieee802154/xbee.c
+@@ -0,0 +1,4539 @@
++/*
++ *	Xbee: XBee TTY for Xbee RF 868 OEM using 802.15.4 stack
++ *
++ *	Authors:
++ *	Joao Pedro Taveira	<joao.silva@inov.pt>
++ *
++ *	This program is free software; you can redistribute it and/or
++ *      modify it under the terms of the GNU General Public License
++ *      as published by the Free Software Foundation; either version
++ *      2 of the License, or (at your option) any later version.
++ */
++
++/**
++ * @file main.c
++ *
++ * @date Jun 25, 2013
++ * @author Joao Pedro Taveira
++ */
++
++
++#ifndef __KERNEL__
++#include <stdio.h>
++#include <inttypes.h>
++#include <signal.h>
++#include <termios.h>
++#include <sys/time.h>
++#include <stdlib.h>
++#include <errno.h>
++#include <pthread.h>
++#include <string.h>
++#include <unistd.h>
++
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++
++#define BUG() do{exit(1);}while(0);
++
++#ifndef pr_fmt
++#define pr_fmt(fmt) fmt
++#endif
++
++#define KERN_EMERG		"emerg: "	/* system is unusable */
++#define KERN_ALERT		"alert: "	/* action must be taken immediately */
++#define KERN_CRIT		"crit : "	/* critical conditions */
++#define KERN_ERR		"error: "	/* error conditions */
++#define KERN_WARNING	"warn : "	/* warning conditions */
++#define KERN_NOTICE		"notic: "	/* normal but significant condition */
++#define KERN_INFO		"info : "	/* informational */
++#define KERN_DEBUG		"debug: "	/* debug-level messages */
++
++#define printk printf
++
++#define pr_debug(fmt, ...) \
++	printk(KERN_DEBUG pr_fmt(fmt), ##__VA_ARGS__)
++
++#define IEEE802154_ADDR_LEN	8
++
++typedef __signed__ char __s8;
++typedef unsigned char __u8;
++
++typedef __signed__ short __s16;
++typedef unsigned short __u16;
++
++typedef __signed__ int __s32;
++typedef unsigned int __u32;
++
++#ifdef __GNUC__
++__extension__ typedef __signed__ long long __s64;
++__extension__ typedef unsigned long long __u64;
++#else
++typedef __signed__ long long __s64;
++typedef unsigned long long __u64;
++#endif /* __GNUC__ */
++
++/*
++ * Below are truly Linux-specific types that should never collide with
++ * any application/library that wants linux/types.h.
++ */
++
++#ifdef __CHECKER__
++#define __bitwise__ __attribute__((bitwise))
++#else
++#define __bitwise__
++#endif
++#ifdef __CHECK_ENDIAN__
++#define __bitwise __bitwise__
++#else
++#define __bitwise
++#endif
++
++typedef __u16 __bitwise __le16;
++typedef __u16 __bitwise __be16;
++typedef __u32 __bitwise __le32;
++typedef __u32 __bitwise __be32;
++typedef __u64 __bitwise __le64;
++typedef __u64 __bitwise __be64;
++
++typedef __u16 __bitwise __sum16;
++typedef __u32 __bitwise __wsum;
++
++struct ieee802154_hw_addr_filt {
++	__le16	pan_id;		/* Each independent PAN selects a unique
++				 * identifier. This PAN id allows communication
++				 * between devices within a network using short
++				 * addresses and enables transmissions between
++				 * devices across independent networks.
++				 */
++	__le16	short_addr;
++	uint8_t	ieee_addr[IEEE802154_ADDR_LEN];
++	uint8_t	pan_coord;
++};
++
++struct ieee802154_dev {
++	/* filled by the driver */
++	int	extra_tx_headroom;
++	uint32_t	flags;
++	struct	device *parent;
++
++	/* filled by mac802154 core */
++	struct	ieee802154_hw_addr_filt hw_filt;
++	void	*priv;
++	struct	wpan_phy *phy;
++};
++
++#else
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/completion.h>
++#include <linux/tty.h>
++#include <linux/skbuff.h>
++#include <linux/sched.h>
++#include <linux/netdevice.h>
++#include <net/mac802154.h>
++#include <net/ieee802154.h>
++#include <net/ieee802154_netdev.h>
++#include <net/wpan-phy.h>
++
++#define MAX_DATA_SIZE	127
++
++#endif /* __KERNEL__ */
++
++/*
++ * API Operation
++ *
++ *  Start Del 1B      Len 2-3B      Bytes 4-n        Byte n+1
++ * +------------+  +-----+------+  +------------+  +------------+
++ * |    0x7E    |  | MSB |  LSB |  |API-specifc |  | ChkSum 1B  |
++ * +------------+  +-----+------+  +------------+  +------------+
++ *
++ * Escape characters. When sending or receiving a UART data frame,
++ * specific data values must be escaped (flagged) so they do not
++ * interfere with the data frame sequencing. To escape an
++ * interfering data byte, insert 0x7D and follow it with the byte
++ * to be escaped XOR’d with 0x20.
++ *
++ * Data bytes that need to be escaped:
++ * 	0x7E – Frame Delimiter
++ * 	0x7D – Escape
++ * 	0x11 – XON
++ * 	0x13 – XOFF
++ * Example - Raw UART Data Frame (before escaping interfering bytes): 
++ * 		0x7E 0x00 0x02 0x23 0x11 0xCB
++ * 		0x11 needs to be escaped which results in the following frame: 
++ * 		0x7E 0x00 0x02 0x23 0x7D 0x31 0xCB
++ * Note: In the above example, the length of the raw data (excluding
++ * the checksum) is 0x0002 and the checksum of the non-escaped data
++ * (excluding frame delimiter and length) is calculated as:
++ * 		0xFF - (0x23 + 0x11) = (0xFF - 0x34) = 0xCB.
++ *
++ * Length
++ * 	The length field has two-byte value that specifies the number of
++ * 	bytes that will be contained in the frame data field. It does not
++ * 	include the checksum field.
++ */
++
++#define XBEE_SYSFS_STATS 1
++
++#define XBEE_START_DELIM	0x7E
++#define XBEE_ESCAPE			0x7D
++#define XBEE_XON			0x11
++#define XBEE_XOFF			0x13
++
++#define XBEE_ADDR_LEN		8
++#define XBEE_DEFAULT_BROADCAST_RADIUS 1
++
++#define XBEE_MAX_FRAME_ID		0x3F /* 0011 1111 mask */
++#define XBEE_TRANSMIT_SPLITTED	0x80 /* 1000 0000 mask */
++#define XBEE_TRANSMIT_PART2		0x40 /* 0100 0000 mask */
++
++//typedef enum mode {
++//	MODE_IDLE,
++//	MODE_RX,
++//	MODE_TX,
++//	MODE_CMD,
++//	MODE_SLEEP
++//} xbee_pro_mode_t;
++
++typedef enum recv_state {
++	RECV_STATE_WAIT_START_DELIM,
++	RECV_STATE_WAIT_MSB,
++	RECV_STATE_WAIT_LSB,
++	RECV_STATE_WAIT_DATA,
++	RECV_STATE_WAIT_CHECKSUM
++} xbee_recv_state_t;
++
++enum motes {
++	NOT_SUPPORTED_MOTE = -1,
++	UNKNOWN_MOTE = 0,
++	XBEE_XB08_DP_MOTE = 1,
++	HM_TRP_433D_MOTE,
++	HM_TRP_868D_MOTE,
++	MAX_MOTE
++};
++
++struct xbee_device {
++	/* Relative devices */
++#ifdef __KERNEL__
++	struct tty_struct	*tty;
++	struct ieee802154_dev	*dev;
++	int 			device_driver;
++#else
++	int			tty_fd;
++	const char	*tty_path;
++#endif
++
++#ifdef __KERNEL__
++	struct mutex	mutex;
++#else
++	pthread_mutex_t	mutex;
++#endif /* __KERNEL__ */
++	uint8_t			frame_id_counter;
++
++	int				escaped_mode;
++//	xbee_pro_mode_t mode;
++
++	/* Command (rx) processing */
++	uint16_t		recv_data_size;
++	unsigned int	recv_data_offset;
++	int				recv_data_escape_next;
++	uint8_t			*recv_data;
++	int				recv_state;
++	uint8_t			recv_data_sum;
++
++	wait_queue_head_t		wq;
++	struct workqueue_struct	*frames_workqueue;
++
++#ifndef __KERNEL__
++	int rx_thread_running;
++	int rx_thread_end;
++	pthread_t rx_thread_tid;
++#endif /* !__KERNEL__ */
++
++	u8				dev_addr[IEEE802154_ADDR_LEN];
++	u16				pan_id;
++	//u8				rf_max_payload;
++
++};
++
++static u8 global_lqi = 0;
++
++#define FRAME_TYPE_AT_CMD					0x08
++#define FRAME_TYPE_AT_CMD_QUEUE				0x09
++#define FRAME_TYPE_TRANSMIT_REQ				0x10
++#define FRAME_TYPE_EXPLICIT_ADDR_CMD		0x11
++#define FRAME_TYPE_REMOTE_AT_CMD_REQ		0x17
++#define FRAME_TYPE_AT_CMD_RESP				0x88
++#define FRAME_TYPE_TRANSMIT_STATUS2			0x89
++#define FRAME_TYPE_MODEM_STATUS				0x8A
++#define FRAME_TYPE_TRANSMIT_STATUS1			0x8B
++#define FRAME_TYPE_RECEIVE_PACKET			0x90
++#define FRAME_TYPE_EXPLICIT_RX_INDICATOR	0x91
++#define FRAME_TYPE_NODE_ID_INDICATOR		0x95
++#define FRAME_TYPE_REMOTE_CMD_RESP			0x97
++
++#define FRAME_TYPE_RAW_TRANSMIT_REQ			0x20	/* simple RAW packet */
++#define FRAME_TYPE_RAW_RECEIVE				FRAME_TYPE_RAW_TRANSMIT_REQ
++#define FRAME_TYPE_RAW_TRANSMIT_STATUS		0xA0	/* RAW packet send completion */
++
++#define TRANSMIT_OPTION_DISABLE_ACK(x) (x | 0x01)
++#define TRANSMIT_OPTION_ENABLE_ACK(x) (x & ~0x01)
++
++#define TRANSMIT_OPTION_DISABLE_ROUTE_DISCOVERY(x) (x | 0x02)
++#define TRANSMIT_OPTION_ENABLE_ROUTE_DISCOVERY(x) (x & ~0x02)
++
++typedef char at_command_t[2];
++typedef char at_command_param_t[4];
++
++typedef struct api_generic {
++	uint8_t		api_id;
++} api_frame_generic_t;
++
++typedef struct at_cmd {
++	uint8_t		api_id;
++	uint8_t		frame_id;
++	at_command_t at_command;
++	at_command_param_t parameter_value;
++	uint8_t		parameter_value_len;
++} api_frame_at_cmd_t;
++
++typedef struct at_cmd_queue {
++	uint8_t		api_id;
++	uint8_t		frame_id;
++	at_command_t at_command;
++	at_command_param_t parameter_value;
++	uint8_t		parameter_value_len;
++} api_frame_at_cmd_queue_t;
++
++typedef struct transmit_req {
++	uint8_t		api_id;
++	uint8_t		frame_id;
++	uint8_t		dst_addr[XBEE_ADDR_LEN]; // 0x000000000000FFFF - Broadcast address
++	uint16_t	reserved; 			// 0xFFFE
++	uint8_t		brd_radius;
++	uint8_t		options; 			// bit 0: disable ACK  bit 1: Dont Attempt route Disc
++	uint8_t		*payload;
++	uint8_t		payload_len;
++} api_frame_transmit_req_t;
++
++typedef struct raw_packet {
++	uint8_t		api_id;
++	union {
++		uint8_t		frame_id;
++		uint8_t		lqi;
++	};
++	uint8_t		*payload;
++	uint8_t		payload_len;
++} api_frame_raw_packet_t;
++
++typedef struct explicit_addr_cmd {
++	uint8_t		api_id;
++	uint8_t		frame_id;
++	uint8_t		dst_addr[XBEE_ADDR_LEN]; // 0x000000000000FFFF - Broadcast address
++	uint16_t	reserved; 			// 0xFFFE
++	uint8_t		src_endpoint;
++	uint8_t		dst_endpoint;
++	uint16_t	cluster_id;
++	uint16_t	profile_id;
++	uint8_t		brd_radius;
++	uint8_t		options; 			// bit 0: disable ACK  bit 1: Dont Attempt route Disc
++	uint8_t		*payload;
++	uint8_t		payload_len;
++} api_frame_explicit_addr_cmd_t;
++
++typedef struct remote_at_cmd_req {
++	uint8_t		api_id;
++	uint8_t		frame_id;
++	uint8_t		dst_addr[XBEE_ADDR_LEN]; // 0x000000000000FFFF - Broadcast address
++	uint16_t	reserved; 			// 0xFFFE
++	uint8_t		remote_options;		// 0x02 - Apply changes on remote. (If not set, AC command must be sent before changes will take effect.) All other bits must be set to 0.
++	at_command_t at_command;
++	at_command_param_t parameter_value;
++	uint8_t		parameter_value_len;
++} api_frame_remote_at_cmd_req_t;
++
++typedef struct at_cmd_resp {
++	uint8_t		api_id;
++	uint8_t		frame_id;
++	at_command_t at_command;
++	uint8_t		cmd_status;			// 0 = OK; 1 = ERROR; 2 = Invalid Command; 3 = Invalid Parameter
++	at_command_param_t		cmd_data;
++	uint8_t		cmd_data_len;
++} api_frame_at_cmd_resp_t;
++
++typedef struct modem_status {
++	uint8_t		api_id;
++	uint8_t		status;
++	// 0x00: Hardware reset
++	// 0x01: Watchdog timer reset
++	// 0x0B: Network woke up
++	// 0x0C: Network went to sleep
++} api_frame_modem_status_t;
++
++typedef struct transmit_status {
++	uint8_t		api_id;
++	uint8_t		frame_id;
++	uint16_t	reserved; 			// 0xFFFE
++	uint8_t		transmit_retry_count; // #transmission retries took place
++	uint8_t		delivery_status;
++	// 0x00 = Success
++	// 0x01 = MAC ACK Failure
++	// 0x15 = Invalid destination endpoint
++	// 0x21 = Network ACK Failure
++	// 0x25 = Route Not Found
++	uint8_t		discovery_status;
++	// 0x00 = No Discovery Overhead
++	// 0x02 = Route Discovery
++} api_frame_transmit_status1_t;
++
++typedef struct transmit_status2 {
++	uint8_t		api_id;
++	uint8_t		frame_id;
++	uint8_t		delivery_status;
++	// 0x00 - Success, no errors were detected on transmission.
++	// 0x01 - An expected MAC acknowledgment never occurred.
++	// 0x02 - CCA failure.
++	// 0x03 - Transmission was purged because it was attempted before the stack was up.
++	// 0x04 - Physical error occurred on the interface with the WiFi transceiver.
++	// 0x18 - No Buffers.
++	// 0x03 - Packet was purged without being transmitted.
++	// 0x21 - An expected network acknowledgment never occurred.
++	// 0x22 - Not joined to network.
++	// 0x23 - Self-addressed.
++	// 0x24 - Address not found.
++	// 0x25 - Route not found.
++	// 0x26 - Broadcast relay was not heard.
++	// 0x2B - Invalid Binding Table Index.
++	// 0x2C - Invalid Endpoint.
++	// 0x31 - A software error occurred.
++	// 0x32 - Resource Error.
++	// 0x74 - Data payload too large.
++	// 0x76 - Attempt to create a client socket failed.
++	// 0xBB - Key not authorized.
++} api_frame_transmit_status2_t;
++
++typedef struct raw_transmit_status {
++	uint8_t		api_id;
++	uint8_t		frame_id;
++	uint8_t		retries;
++	uint8_t		delivery_status;
++} api_frame_raw_transmit_status_t;
++
++typedef struct receive_packet {
++	uint8_t		api_id;
++	uint8_t		src_addr[XBEE_ADDR_LEN];
++	uint16_t	reserved; 		// 0xFFFE
++	uint8_t		options;		// 0x01 - Packet Acknowledged; 0x02 - Packet was a broadcast packet
++	uint8_t		*payload;
++	uint8_t		payload_len;
++} api_frame_receive_packet_t;
++
++typedef struct explicit_rx_indicator {
++	uint8_t		api_id;
++	uint8_t		src_addr[XBEE_ADDR_LEN];
++	uint16_t	reserved; 		// 0xFFFE
++	uint8_t		src_endpoint;
++	uint8_t		dst_endpoint;
++	uint16_t	cluster_id;
++	uint16_t	profile_id;
++	uint8_t		options;		// 0x01 - Packet Acknowledged; 0x02 - Packet was a broadcast packet
++	uint8_t		*payload;
++	uint8_t		payload_len;
++} api_frame_explicit_rx_indicator_t;
++
++typedef struct node_id_indicator {
++	uint8_t		api_id;
++	uint8_t		sender_addr[XBEE_ADDR_LEN]; // 64bit addr sender
++	uint16_t	sender_short_addr;	// 16bit addr senders
++	uint8_t		options;		// 0x01 - Packet Acknowledged; 0x02 - Packet was a broadcast packet
++	uint16_t	src_short_addr;		// Set to the 16-bit network address of the remote. Set to 0xFFFE if unknown.
++	uint8_t		src_addr[XBEE_ADDR_LEN];
++	unsigned char *ni_string;
++	uint16_t	parent_short_addr;
++} api_frame_node_id_indicator_t;
++
++typedef struct remote_cmd_resp {
++	uint8_t		api_id;
++	uint8_t		frame_id;
++	uint8_t		src_addr[XBEE_ADDR_LEN];
++	uint16_t	reserved; 		// 0xFFFE
++	at_command_t at_command;
++	uint8_t		cmd_status;			// 0 = OK; 1 = ERROR; 2 = Invalid Command; 3 = Invalid Parameter
++	at_command_param_t cmd_data;
++	uint8_t		cmd_data_len;
++} api_frame_remote_cmd_resp_t;
++
++typedef struct xbee_api_frame {
++	uint16_t	len;
++	uint8_t		api_id;
++	uint8_t		*raw_data;
++	union api_cmd_data_union {
++		api_frame_generic_t api_generic;
++		api_frame_at_cmd_t at_cmd;
++		api_frame_at_cmd_queue_t at_cmd_queue;
++		api_frame_transmit_req_t transmit_req;
++		api_frame_explicit_addr_cmd_t explitcit_addr_cmd;
++		api_frame_remote_at_cmd_req_t remote_at_cmd_req;
++		api_frame_at_cmd_resp_t at_cmd_resp;
++		api_frame_modem_status_t modem_status;
++		api_frame_transmit_status1_t transmit_status;
++		api_frame_transmit_status2_t transmit_status2;
++		api_frame_receive_packet_t receive_packet;
++		api_frame_explicit_rx_indicator_t explicit_rx_indicator;
++		api_frame_node_id_indicator_t node_id_indicator;
++		api_frame_remote_cmd_resp_t remote_cmd_resp;
++
++		api_frame_raw_packet_t raw_packet;
++		api_frame_raw_transmit_status_t raw_transmit_status;
++	} *api_data;
++	uint8_t		checksum;
++
++#ifdef __KERNEL__
++	struct completion	complete;
++	struct mutex		mutex;
++#else
++	pthread_cond_t complete;
++	pthread_mutex_t	mutex;
++#endif
++	struct xbee_api_frame *response;
++
++} _api_frame_t;
++
++/*
++ * TTY Helpers
++ */
++
++#ifndef __KERNEL__
++
++/*
++ * functions from:
++ * http://stackoverflow.com/questions/6947413/how-to-open-read-and-write-from-serial-port-in-c
++ */
++
++static int set_interface_attribs(int fd, int speed, int parity) {
++	struct termios tty;
++	memset(&tty, 0, sizeof tty);
++	if (tcgetattr(fd, &tty) != 0) {
++		printk(KERN_ERR "%s(): error %d from tcgetattr", __func__, errno);
++		return -1;
++	}
++
++	cfsetospeed(&tty, speed);
++	cfsetispeed(&tty, speed);
++
++	tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;     // 8-bit chars
++	// disable IGNBRK for mismatched speed tests; otherwise receive break
++	// as \000 chars
++	tty.c_iflag &= ~IGNBRK;         // ignore break signal
++	tty.c_lflag = 0;                // no signaling chars, no echo,
++									// no canonical processing
++	tty.c_oflag = 0;                // no remapping, no delays
++	tty.c_cc[VMIN] = 0;            // read doesn't block
++	tty.c_cc[VTIME] = 5;            // 0.5 seconds read timeout
++
++	tty.c_iflag &= ~(IXON | IXOFF | IXANY); // shut off xon/xoff ctrl
++
++	tty.c_cflag |= (CLOCAL | CREAD); // ignore modem controls,
++									 // enable reading
++	tty.c_cflag &= ~(PARENB | PARODD);      // shut off parity
++	tty.c_cflag |= parity;
++	tty.c_cflag &= ~CSTOPB;
++	tty.c_cflag &= ~CRTSCTS;
++
++	if (tcsetattr(fd, TCSANOW, &tty) != 0) {
++		printk(KERN_ERR "%s(): error %d from tcsetattr", __func__, errno);
++		return -1;
++	}
++	return 0;
++}
++
++static void
++set_blocking (int fd, int should_block)
++{
++	struct termios tty;
++	memset(&tty, 0, sizeof tty);
++	if (tcgetattr(fd, &tty) != 0) {
++		printk(KERN_ERR "%s(): error %d from tggetattr", __func__, errno);
++		return;
++	}
++
++	tty.c_cc[VMIN] = should_block ? 1 : 0;
++	tty.c_cc[VTIME] = 5;            // 0.5 seconds read timeout
++
++	if (tcsetattr(fd, TCSANOW, &tty) != 0)
++		printk(KERN_ERR "%s(): error %d setting term attributes", __func__,
++				errno);
++}
++
++
++/*
++ * XBee Dev helpers
++ */
++static
++struct xbee_device *xbee_device_new()
++{
++	struct xbee_device *xbee_dev;
++#ifdef __KERNEL__
++	xbee_dev = kzalloc(sizeof(struct xbee_device),GFP_KERNEL);
++#else
++	xbee_dev = calloc(1,sizeof(struct xbee_device));
++#endif
++	if(!xbee_dev)
++	{
++		printk(KERN_ERR "%s(): unable to allocate memory\n", __func__);
++		BUG();
++	}
++	xbee_dev->escaped_mode = 1;
++	xbee_dev->frame_id_counter = 1;
++	xbee_dev->recv_state = RECV_STATE_WAIT_START_DELIM;
++//	xbee_dev->rf_max_payload = 100;
++
++#ifdef __KERNEL__
++	mutex_init(&xbee_dev->mutex);
++#else
++	pthread_mutex_init(&xbee_dev->mutex,NULL);
++#endif
++
++	return xbee_dev;
++}
++
++static
++void xbee_device_release(struct xbee_device *xbee_dev)
++{
++	if(!xbee_dev)
++	{
++		printk(KERN_ERR "%s: xbee_dev NULL pointer\n", __func__);
++		BUG();
++	}
++	if(xbee_dev->recv_data)
++	{
++#ifdef __KERNEL__
++		kfree(xbee_dev->recv_data);
++#else
++		free(xbee_dev->recv_data);
++#endif
++		xbee_dev->recv_data = NULL;
++	}
++
++#ifndef __KERNEL__
++	pthread_mutex_destroy(&xbee_dev->mutex);
++#endif
++
++#ifndef __KERNEL__
++	if(xbee_dev->tty_fd>0)
++	{
++		close(xbee_dev->tty_fd);
++	}
++#endif
++
++#ifdef __KERNEL__
++	kfree(xbee_dev);
++#else
++	free(xbee_dev);
++#endif
++	xbee_dev = NULL;
++}
++
++#endif /* !__KERNEL__ */
++
++#ifdef __KERNEL__
++#ifdef XBEE_SYSFS_STATS
++typedef struct xbee_mac_stat {
++	int 			defined;
++	u8				addr[XBEE_ADDR_LEN];
++	unsigned long	last_update; // in jiffies
++	u8				last_lqi;
++} xbee_mac_stat_t;
++
++#define XBEE_MOTE_MAXCOUNT 256
++typedef struct xbee_mac_stats {
++	struct mutex	mutex;
++	xbee_mac_stat_t	mote[XBEE_MOTE_MAXCOUNT];
++} xbee_stats_t;
++
++static xbee_stats_t *stats = NULL;
++
++int xbee_addr_equals(u8 addr1[XBEE_ADDR_LEN], u8 addr2[XBEE_ADDR_LEN])
++{
++	int i = 0;
++	for(i=0;i<XBEE_ADDR_LEN;i++)
++	{
++		if(addr1[i] != addr2[i])
++			return 0;
++	}
++	return 1;
++}
++
++xbee_mac_stat_t *xbee_stat_get_unsafe(u8 addr[XBEE_ADDR_LEN])
++{
++	int i = 0;
++	xbee_mac_stat_t *mac_stat = NULL;
++	for(i=0;i<XBEE_MOTE_MAXCOUNT;i++)
++	{
++		mac_stat = &stats->mote[i];
++		if(!mac_stat->defined)
++		{
++			memcpy(mac_stat->addr,addr, XBEE_ADDR_LEN);
++			mac_stat->defined = 1;
++			break;
++		} else if(xbee_addr_equals(addr,mac_stat->addr)){
++			break;
++		}
++	}
++	return mac_stat;
++}
++
++int xbee_stat_update_lqi(u8 addr[XBEE_ADDR_LEN], u8 lqi)
++{
++	xbee_mac_stat_t *mac_stat = NULL;
++	mutex_lock(&stats->mutex);
++	mac_stat = xbee_stat_get_unsafe(addr);
++	if(mac_stat)
++	{
++		mac_stat->last_lqi = lqi;
++		mac_stat->last_update = jiffies;
++	}
++	mutex_unlock(&stats->mutex);
++	return 0;
++}
++
++static const char *
++eui64_address_to_str(uint8_t addr[XBEE_ADDR_LEN],char eui64_addr_str[24]);
++
++#define XBEE_LQI_TABLE_MAX_LEN 4096
++
++static ssize_t
++xbee_stat_get_lqi_table(char str[XBEE_LQI_TABLE_MAX_LEN])
++{
++	ssize_t count = 0;
++	ssize_t len = 0;
++	int i = 0;
++	unsigned long now = jiffies;
++	unsigned long diff = 0;
++	xbee_mac_stat_t *mac_stat = NULL;
++	char eui64_addr_str[24] = {};
++	mutex_lock(&stats->mutex);
++	for(i = 0;i<XBEE_MOTE_MAXCOUNT; i++)
++	{
++		mac_stat = &stats->mote[i];
++		if(mac_stat && mac_stat->defined)
++		{
++			diff = (long) now - (long) mac_stat->last_update;
++			count = sprintf(str+len,"%s\t%6ld ms\t%3d (0x%02X)\n",eui64_address_to_str(mac_stat->addr,eui64_addr_str),diff * 1000 / HZ, mac_stat->last_lqi,mac_stat->last_lqi);
++			len += count;
++		}
++	}
++	mutex_unlock(&stats->mutex);
++	return len;
++}
++
++static int xbee_stats_init(void){
++	stats = kzalloc(sizeof(xbee_stats_t),GFP_KERNEL);
++	if(!stats)
++		return -ENOMEM;
++	mutex_init(&stats->mutex);
++	return 0;
++}
++
++static int xbee_stats_tini(void) {
++	if(stats)
++		kfree(stats);
++	return 0;
++}
++
++#endif
++#endif
++
++static uint8_t
++_xbee_device_gen_frame_id(struct xbee_device *xbee_dev)
++{
++	uint8_t frame_id;
++	if(!xbee_dev)
++		return 0;
++#ifdef __KERNEL__
++	mutex_lock(&xbee_dev->mutex);
++#else
++	pthread_mutex_lock(&xbee_dev->mutex);
++#endif
++	frame_id = xbee_dev->frame_id_counter = (xbee_dev->frame_id_counter+1)%XBEE_MAX_FRAME_ID;
++	if(frame_id == 0)
++	{
++		frame_id = xbee_dev->frame_id_counter = 1;
++	}
++#ifdef __KERNEL__
++	mutex_unlock(&xbee_dev->mutex);
++#else
++	pthread_mutex_unlock(&xbee_dev->mutex);
++#endif
++	return frame_id;
++}
++
++
++static int escape_required(uint8_t c);
++
++#ifndef __KERNEL__
++static int
++xbee_device_write_to_phy(struct xbee_device *xbee_dev, unsigned char *buf, unsigned int len)
++{
++	int i = 0;
++	uint8_t raw_byte = 0;
++	uint8_t escape_value = XBEE_ESCAPE;
++	unsigned char *raw_data = (unsigned char *) buf;
++	for(i = 0;i<len;i++){
++		raw_byte = ((unsigned char)*(raw_data+i));
++		if(i > 2 && xbee_dev->escaped_mode && escape_required(raw_byte))
++		{
++			//printf("%02X ",XBEE_ESCAPE);
++			write(xbee_dev->tty_fd,&escape_value,1);
++			raw_byte = raw_byte^0x20;
++		}
++		write(xbee_dev->tty_fd,&raw_byte,1);
++		//printf("%02X ",raw_byte);
++	}
++	printf("\n");
++	return len;
++}
++
++static int
++xbee_device_init(struct xbee_device *xbee_dev)
++{
++	if(!xbee_dev)
++	{
++		printk(KERN_ERR "%s: xbee_dev NULL pointer\n", __func__);
++		BUG();
++	}
++#ifndef __KERNEL__
++	if((xbee_dev->tty_fd = open(xbee_dev->tty_path,O_RDWR | O_NOCTTY | O_SYNC)) < 0)
++	{
++		printk(KERN_ERR "%s: error opening tty %s: %s\n", __func__, xbee_dev->tty_path,strerror(errno));
++		return -1;
++	}
++
++	set_interface_attribs (xbee_dev->tty_fd, B9600, 0);  // set speed to 115,200 bps, 8n1 (no parity)
++	set_blocking (xbee_dev->tty_fd, 0);                // set no blocking
++#endif /* !__KERNEL__ */
++	return 0;
++}
++#endif /* !__KERNEL__ */
++
++#ifdef __KERNEL__
++
++#define XBEE_FRAME_MAX_SIZE 255
++
++static struct mote_id {
++	int 	type;
++	u8		id[4];
++	char	*description;
++} mote_ids[4] = {
++		{
++				.type = XBEE_XB08_DP_MOTE,
++				.id = {0x00,0x06,0x00,0x00},
++				.description = "XBee 868 point to multi-point (868MHz for EU market)",
++		},
++		{
++				.type = HM_TRP_433D_MOTE,
++				.id = {0xFF,0xFF,0x00,0x43},
++				.description = "HM-TRP Series 100mW Transceiver modules (HM-TRP-433D)",
++		},
++		{
++				.type = HM_TRP_868D_MOTE,
++				.id = {0xFF,0xFF,0x00,0x86},
++				.description = "HM-TRP Series 100mW Transceiver modules (HM-TRP-868D)",
++		},
++		{
++				.type = NOT_SUPPORTED_MOTE,
++				.id = {0x00,0x00,0x00,0x00},
++				.description = "Not supported device",
++		},
++};
++
++int mote_id_equals(u8 id1[4], u8 id2[4]){
++	int i = 0;
++	for(i=0;i<4;i++){
++		if(id1[i] != id2[i])
++			return 0;
++	}
++	return 1;
++}
++
++static int
++xbee_api_at_command_read_u32(struct xbee_device *xbee_dev, const char cmdid[3], uint8_t value[4]);
++
++static int
++xbee_device_get_type(struct xbee_device *xbee_dev){
++	int mote_type = UNKNOWN_MOTE;
++	u8 mote_id[4] = {0};
++	int i = 0;
++	int err = 0;
++	mutex_lock(&xbee_dev->mutex);
++	mote_type = xbee_dev->device_driver;
++	mutex_unlock(&xbee_dev->mutex);
++	if(mote_type != UNKNOWN_MOTE){
++		return mote_type;
++	}
++	err = xbee_api_at_command_read_u32(xbee_dev,"DD",mote_id);
++	if(err) {
++		printk(KERN_ERR "%s: error getting device type\n", __func__);
++		return err;
++	}
++	else {
++		print_hex_dump_bytes("xbee_device_get_type(): device type: ", DUMP_PREFIX_NONE, mote_id, 4);
++	}
++	while(mote_type != NOT_SUPPORTED_MOTE){
++		mote_type = mote_ids[i].type;
++		//printk(KERN_INFO "%s: checking type: %d: %s\n", __func__,mote_ids[i].type,mote_ids[i].description);
++		//print_hex_dump_bytes("xbee_device_get_type(): checking: ", DUMP_PREFIX_NONE, mote_ids[i].id, 4);
++		if(mote_id_equals(mote_ids[i].id,mote_id) || mote_type == NOT_SUPPORTED_MOTE){
++			mutex_lock(&xbee_dev->mutex);
++			xbee_dev->device_driver = mote_type;
++			mutex_unlock(&xbee_dev->mutex);
++			printk(KERN_INFO "xbee: found mote: %s\n", mote_ids[i].description);
++			break;
++		}
++		i++;
++	}
++	return mote_type;
++}
++
++static int
++xbee_device_write_to_phy(struct xbee_device *xbee_dev, unsigned char *buf, unsigned int len){
++	struct tty_struct *tty;
++	unsigned int sent = 0;
++
++	int i = 0;
++	u8 raw_byte = 0;
++	u8 escape_value = XBEE_ESCAPE;
++	unsigned char *raw_data = (unsigned char *) buf;
++
++	BUG_ON(!xbee_dev);
++	tty = xbee_dev->tty;
++	if (!tty)
++		return -ENODEV;
++
++	/* Debug info */
++	pr_debug("%s(): %d bytes frame\n", __func__, len);
++#ifdef DEBUG
++	print_hex_dump_bytes("send_pending_data ", DUMP_PREFIX_NONE,
++			buf, len);
++#endif
++
++	pr_debug("%s(): sending %d\n", __func__,len);
++	for(i = 0;i<len;i++){
++		raw_byte = ((unsigned char)*(raw_data+i));
++		if(i > 0 && xbee_dev->escaped_mode && escape_required(raw_byte))
++		{
++			if (tty->driver->ops->write(tty, &escape_value,1) != 1) {
++				printk(KERN_ERR "%s: device write failed\n", __func__);
++				return -1;
++			}
++			raw_byte = raw_byte^0x20;
++		}
++		if (tty->driver->ops->write(tty, &raw_byte,1) != 1) {
++			printk(KERN_ERR "%s: device write failed\n", __func__);
++			return -1;
++		}
++		sent++;
++	}
++	return sent;
++}
++#endif /* __KERNEL__ */
++
++static _api_frame_t *temporary_frames_list[1000] = {};
++static int
++_api_frame_should_wait_response(_api_frame_t *api_frame);
++
++static int
++xbee_device_add_pendent_req(struct xbee_device *xbee_dev, _api_frame_t *api_frame)
++{
++	int index = 0;
++
++	if(xbee_dev == NULL)
++	{
++		printk(KERN_ERR "%s: xbee_dev NULL pointer\n", __func__);
++		BUG();
++	}
++	if(api_frame == NULL)
++	{
++		printk(KERN_ERR "%s: api_frame NULL pointer\n", __func__);
++		BUG();
++	}
++
++#ifdef __KERNEL__
++	//if (mutex_lock_interruptible(&xbee_dev->mutex))
++	//	return -EINTR;
++	mutex_lock(&xbee_dev->mutex);
++#else
++	if(pthread_mutex_lock(&xbee_dev->mutex))
++		return -EINTR;
++#endif
++
++	index = _api_frame_should_wait_response(api_frame);
++	temporary_frames_list[index] = api_frame;
++
++#ifdef __KERNEL__
++	mutex_unlock(&xbee_dev->mutex);
++#else
++	pthread_mutex_unlock(&xbee_dev->mutex);
++#endif
++
++	return 0;
++}
++
++static int
++xbee_device_remove_pendent_req(struct xbee_device *xbee_dev, _api_frame_t *api_frame)
++{
++	int index = 0;
++
++	if(xbee_dev == NULL)
++	{
++		printk(KERN_ERR "%s: xbee_dev NULL pointer\n", __func__);
++		BUG();
++	}
++	if(api_frame == NULL)
++	{
++		printk(KERN_ERR "%s: api_frame NULL pointer\n", __func__);
++		BUG();
++	}
++
++	pr_debug("%s(): removing pendent req\n", __func__);
++
++#ifdef __KERNEL__
++	if (mutex_lock_interruptible(&xbee_dev->mutex))
++		return -EINTR;
++#else
++	if(pthread_mutex_lock(&xbee_dev->mutex))
++		return -EINTR;
++#endif
++
++	index = _api_frame_should_wait_response(api_frame);
++	if(index)
++		temporary_frames_list[index] = NULL;
++
++#ifdef __KERNEL__
++	mutex_unlock(&xbee_dev->mutex);
++#else
++	pthread_mutex_unlock(&xbee_dev->mutex);
++#endif
++
++	return 0;
++}
++
++static int
++_api_frame_should_signal_pendent(_api_frame_t *api_frame);
++static void
++_api_frame_print(_api_frame_t *api_frame);
++
++static int
++xbee_device_signal_pendent_req(struct xbee_device *xbee_dev, _api_frame_t *api_frame_response)
++{
++	int index = 0;
++	_api_frame_t *api_frame_req = NULL;
++
++	if(xbee_dev == NULL)
++	{
++		printk(KERN_ERR "%s: xbee_dev NULL pointer\n", __func__);
++		BUG();
++	}
++	if(api_frame_response == NULL)
++	{
++		printk(KERN_ERR "%s: api_frame NULL pointer\n", __func__);
++		BUG();
++	}
++
++#ifdef __KERNEL__
++	if (mutex_lock_interruptible(&xbee_dev->mutex))
++		return -EINTR;
++#else
++	if(pthread_mutex_lock(&xbee_dev->mutex))
++		return -EINTR;
++#endif
++
++	index = _api_frame_should_signal_pendent(api_frame_response);
++	api_frame_req = temporary_frames_list[index];
++
++	if(api_frame_req != NULL)
++	{
++		pr_debug("%s(): api_frame found...\n", __func__);
++		_api_frame_print(api_frame_req);
++#ifndef __KERNEL__
++		pthread_mutex_lock(&api_frame_req->mutex);
++#endif
++		api_frame_req->response = api_frame_response;
++#ifndef __KERNEL__
++		pthread_cond_signal(&api_frame_req->complete);
++		pthread_mutex_unlock(&api_frame_req->mutex);
++#else
++		complete(&api_frame_req->complete);
++#endif
++	}
++	else
++	{
++		printk(KERN_DEBUG "%s: api_frame NOT found: %d\n", __func__,index);
++	}
++
++	temporary_frames_list[index] = NULL;
++
++#ifdef __KERNEL__
++	mutex_unlock(&xbee_dev->mutex);
++#else
++	pthread_mutex_unlock(&xbee_dev->mutex);
++#endif
++
++	return 0;
++}
++
++/*
++ * Debug helpers
++ */
++
++#ifdef DEBUG
++static const char *
++xbee_recv_state_str(int recv_state)
++{
++	switch(recv_state)
++	{
++	case RECV_STATE_WAIT_START_DELIM:
++		return "RECV_STATE_WaitStartDelim";
++		break;
++	case RECV_STATE_WAIT_MSB:
++		return "RECV_STATE_WaitMSB";
++		break;
++	case RECV_STATE_WAIT_LSB:
++		return "RECV_STATE_WaitLSB";
++		break;
++	case RECV_STATE_WAIT_DATA:
++		return "RECV_STATE_WaitData";
++		break;
++	case RECV_STATE_WAIT_CHECKSUM:
++		return "RECV_STATE_WaitCheckSum";
++		break;
++	default:
++		return "RECV_STATE_Unknown";
++		break;
++	}
++	return "RECV_STATE_Unknown";
++}
++#endif /* DEBUG */
++
++static int
++at_command_get_parameter_len(_api_frame_t *api_frame)
++{
++	int	at_parameter_len = 0;
++	if(!api_frame)
++		return 0;
++	switch(api_frame->api_id){
++	case FRAME_TYPE_AT_CMD:
++		at_parameter_len = api_frame->len-4;
++		break;
++	case FRAME_TYPE_AT_CMD_QUEUE:
++		at_parameter_len = api_frame->len-4;
++		break;
++	case FRAME_TYPE_REMOTE_AT_CMD_REQ:
++		at_parameter_len = api_frame->len-15;
++		break;
++	case FRAME_TYPE_AT_CMD_RESP:
++		at_parameter_len = api_frame->len-5;
++		break;
++	case FRAME_TYPE_REMOTE_CMD_RESP:
++		at_parameter_len = api_frame->len-15;
++		break;
++	default:
++		return 0;
++	}
++	return at_parameter_len;
++}
++
++#ifdef DEBUG
++static const char *
++at_command_get_parameter_str(_api_frame_t *api_frame,char *str_aux)
++{
++	uint8_t *at_data = NULL;
++	int wrote_bytes = 0;
++	int	at_parameter_len = 0;
++	int i = 0;
++	if(!api_frame)
++		return "";
++	at_parameter_len = at_command_get_parameter_len(api_frame);
++	switch(api_frame->api_id){
++	case FRAME_TYPE_AT_CMD:
++		at_data = (uint8_t *) api_frame->api_data->at_cmd.parameter_value;
++		break;
++	case FRAME_TYPE_AT_CMD_QUEUE:
++		at_data = (uint8_t *) api_frame->api_data->at_cmd_queue.parameter_value;
++		break;
++	case FRAME_TYPE_REMOTE_AT_CMD_REQ:
++		at_data = (uint8_t *) api_frame->api_data->remote_at_cmd_req.parameter_value;
++		break;
++	case FRAME_TYPE_AT_CMD_RESP:
++		at_data = (uint8_t *) api_frame->api_data->at_cmd_resp.cmd_data;
++		break;
++	case FRAME_TYPE_REMOTE_CMD_RESP:
++		at_data = (uint8_t *) api_frame->api_data->remote_cmd_resp.cmd_data;
++		break;
++	default:
++		return "";
++	}
++	for(i=0;i<at_parameter_len;i++)
++	{
++		wrote_bytes += sprintf(str_aux+wrote_bytes,"%02X",at_data[i]);
++	}
++	str_aux[wrote_bytes] = '\0';
++	return str_aux;
++}
++#endif /* DEBUG */
++
++static const char *
++eui64_address_to_str(uint8_t addr[XBEE_ADDR_LEN],char eui64_addr_str[24])
++{
++	int i = 0;
++	int wrote_bytes = 0;
++	for(i=0;i<XBEE_ADDR_LEN;i++)
++	{
++		if(i)
++			wrote_bytes += sprintf(eui64_addr_str+wrote_bytes,":");
++		wrote_bytes += sprintf(eui64_addr_str+wrote_bytes,"%02X",addr[i]);
++	}
++	eui64_addr_str[wrote_bytes] = '\0';
++	return eui64_addr_str;
++}
++
++
++/*
++ * API Frame helpers
++ */
++
++static void _api_frame_free(_api_frame_t *api_frame);
++
++static _api_frame_t *
++_api_frame_alloc(size_t frame_len, size_t data_len)
++{
++	void *api_data = NULL;
++	_api_frame_t *api_frame = NULL;
++#ifdef __KERNEL__
++	api_frame = kzalloc(sizeof(_api_frame_t),GFP_KERNEL);
++#else
++	api_frame = calloc(1,sizeof(_api_frame_t));
++#endif
++	if(!api_frame)
++	{
++		printk(KERN_ERR "%s(): unable to allocate memory to api_frame\n", __func__);
++		BUG();
++	}
++	api_frame->len = frame_len;
++#ifdef __KERNEL__
++	api_data = kzalloc(data_len,GFP_KERNEL);
++#else
++	api_data = calloc(data_len,sizeof(uint8_t));
++#endif
++	if(!api_data)
++	{
++		printk(KERN_ERR "%s(): unable to allocate memory to api_data\n", __func__);
++		_api_frame_free(api_frame);
++		api_frame = NULL;
++		BUG();
++	}
++
++	api_frame->api_data = (union api_cmd_data_union*) api_data;
++
++#ifdef __KERNEL__
++	mutex_init(&api_frame->mutex);
++#else
++	pthread_mutex_init(&api_frame->mutex,NULL);
++#endif
++
++#ifdef __KERNEL__
++	init_completion(&api_frame->complete);
++#else
++	pthread_cond_init(&api_frame->complete,NULL);
++#endif
++
++	api_frame->response = NULL;
++
++	return api_frame;
++}
++
++static uint8_t *
++_api_frame_to_raw(_api_frame_t *api_frame, uint16_t *p_len)
++{
++	uint8_t *raw_data = NULL;
++	uint8_t frame_sum = 0;
++	int raw_offset = 0;
++	int i = 0;
++	uint16_t raw_data_len = 1 /* start delim */ + 2 /* 16 bit length */;
++	if(!api_frame)
++	{
++		printk(KERN_ERR "%s(): invalid frame\n", __func__);
++		BUG();
++	}
++	if(!p_len)
++	{
++		printk(KERN_ERR "%s(): invalid len pointer\n", __func__);
++		BUG();
++	}
++
++	/* Compute buffer length */
++	switch(api_frame->api_id)
++	{
++	// Requests
++	case FRAME_TYPE_AT_CMD:
++		raw_data_len += 1 /* frame type */ + 1 /* frame id */ + 2 /* at command */;
++		raw_data_len += api_frame->api_data->at_cmd.parameter_value_len;
++		break;
++	case FRAME_TYPE_AT_CMD_QUEUE:
++		raw_data_len += 1 /* frame type */ + 1 /* frame id */ + 2 /* at command */;
++		raw_data_len += api_frame->api_data->at_cmd_queue.parameter_value_len;
++		break;
++	case FRAME_TYPE_TRANSMIT_REQ:
++		raw_data_len += 1 /* frame type */ + 1 /* frame id */;
++		raw_data_len += 8 /* dst addr */ + 2 /* reserved */;
++		raw_data_len += 1 /* bcast radius */ + 1 /* options */;
++		raw_data_len += api_frame->api_data->transmit_req.payload_len;
++		break;
++	case FRAME_TYPE_RAW_TRANSMIT_REQ:
++		raw_data_len += 1 /* frame type */ + 1 /* frame id */;
++		raw_data_len += api_frame->api_data->raw_packet.payload_len;
++		break;
++	case FRAME_TYPE_EXPLICIT_ADDR_CMD:
++		raw_data_len += 1 /* frame type */ + 1 /* frame id */;
++		raw_data_len += 8 /* dst addr */ + 2 /* reserved */;
++		raw_data_len += 1 /* src endpoint */ + 1 /* dst endpoint */;
++		raw_data_len += 2 /* clusterID */ + 2 /* profile ID*/;
++		raw_data_len += 1 /* bcast radius */ + 1 /* options */;
++		raw_data_len += api_frame->api_data->explitcit_addr_cmd.payload_len;
++		break;
++	case FRAME_TYPE_REMOTE_AT_CMD_REQ:
++		raw_data_len += 1 /* frame type */ + 1 /* frame id */;
++		raw_data_len += 8 /* dst addr */ + 2 /* reserved */;
++		raw_data_len += 1 /* remote command options */ + 2 /* at command */;
++		raw_data_len += api_frame->api_data->remote_at_cmd_req.parameter_value_len;
++		break;
++
++	// Responses
++	case FRAME_TYPE_AT_CMD_RESP:
++		break;
++	case FRAME_TYPE_MODEM_STATUS:
++		break;
++	case FRAME_TYPE_TRANSMIT_STATUS1:
++		break;
++	case FRAME_TYPE_TRANSMIT_STATUS2:
++		break;
++	case FRAME_TYPE_RAW_TRANSMIT_STATUS:
++		break;
++	case FRAME_TYPE_RECEIVE_PACKET:
++		break;
++	case FRAME_TYPE_EXPLICIT_RX_INDICATOR:
++		break;
++	case FRAME_TYPE_NODE_ID_INDICATOR:
++		break;
++	case FRAME_TYPE_REMOTE_CMD_RESP:
++		break;
++	default:
++		printk(KERN_WARNING "%s(): Unknown Type (0x%02X)\n", __func__,api_frame->api_id);
++		break;
++		return NULL;
++	}
++	raw_data_len += 1 /* checksum */;
++
++#ifdef __KERNEL__
++	raw_data = kzalloc(raw_data_len*sizeof(uint8_t),GFP_KERNEL);
++#else
++	raw_data = calloc(raw_data_len,sizeof(uint8_t));
++#endif
++	if(!raw_data)
++	{
++		printk(KERN_ERR "%s(): unable to allocate memory\n", __func__);
++		return NULL;
++	}
++
++	*p_len = raw_data_len;
++
++	raw_data[raw_offset++] = XBEE_START_DELIM;
++	raw_data[raw_offset++] = (raw_data_len-4) >> 8 & 0xFF;
++	raw_data[raw_offset++] = (raw_data_len-4) & 0xFF;
++
++	/* Fill buffer */
++	switch(api_frame->api_id)
++	{
++	// Requests
++	case FRAME_TYPE_AT_CMD:
++		raw_data[raw_offset] = api_frame->api_data->at_cmd.api_id;
++		frame_sum += raw_data[raw_offset++];
++		raw_data[raw_offset] = api_frame->api_data->at_cmd.frame_id;
++		frame_sum += raw_data[raw_offset++];
++		raw_data[raw_offset] = api_frame->api_data->at_cmd.at_command[0];
++		frame_sum += raw_data[raw_offset++];
++		raw_data[raw_offset] = api_frame->api_data->at_cmd.at_command[1];
++		frame_sum += raw_data[raw_offset++];
++		for(i=0;i<api_frame->api_data->at_cmd.parameter_value_len;i++)
++		{
++			raw_data[raw_offset] = api_frame->api_data->at_cmd.parameter_value[i];
++			frame_sum += raw_data[raw_offset++];
++		}
++		break;
++	case FRAME_TYPE_AT_CMD_QUEUE:
++		raw_data[raw_offset] = api_frame->api_data->at_cmd_queue.api_id;
++		frame_sum += raw_data[raw_offset++];
++		raw_data[raw_offset] = api_frame->api_data->at_cmd_queue.frame_id;
++		frame_sum += raw_data[raw_offset++];
++		raw_data[raw_offset] = api_frame->api_data->at_cmd_queue.at_command[0];
++		frame_sum += raw_data[raw_offset++];
++		raw_data[raw_offset] = api_frame->api_data->at_cmd_queue.at_command[1];
++		frame_sum += raw_data[raw_offset++];
++		for(i=0;i<api_frame->api_data->at_cmd_queue.parameter_value_len;i++)
++		{
++			raw_data[raw_offset] = api_frame->api_data->at_cmd_queue.parameter_value[i];
++			frame_sum += raw_data[raw_offset++];
++		}
++		break;
++	case FRAME_TYPE_TRANSMIT_REQ:
++		raw_data[raw_offset] = api_frame->api_data->transmit_req.api_id;
++		frame_sum += raw_data[raw_offset++];
++		raw_data[raw_offset] = api_frame->api_data->transmit_req.frame_id;
++		frame_sum += raw_data[raw_offset++];
++		for(i=0;i<XBEE_ADDR_LEN;i++)
++		{
++			raw_data[raw_offset] = api_frame->api_data->transmit_req.dst_addr[i];
++			frame_sum += raw_data[raw_offset++];
++		}
++		raw_data[raw_offset] = api_frame->api_data->transmit_req.reserved >> 8 & 0xFF;
++		frame_sum += raw_data[raw_offset++];
++		raw_data[raw_offset] = api_frame->api_data->transmit_req.reserved & 0xFF;
++		frame_sum += raw_data[raw_offset++];
++		raw_data[raw_offset] = api_frame->api_data->transmit_req.brd_radius;
++		frame_sum += raw_data[raw_offset++];
++		raw_data[raw_offset] = api_frame->api_data->transmit_req.options;
++		frame_sum += raw_data[raw_offset++];
++
++		for(i=0;i<api_frame->api_data->transmit_req.payload_len;i++)
++		{
++			raw_data[raw_offset] = api_frame->api_data->transmit_req.payload[i];
++			frame_sum += raw_data[raw_offset++];
++		}
++		break;
++	case FRAME_TYPE_RAW_TRANSMIT_REQ:
++		raw_data[raw_offset] = api_frame->api_data->raw_packet.api_id;
++		frame_sum += raw_data[raw_offset++];
++		raw_data[raw_offset] = api_frame->api_data->raw_packet.frame_id;
++		frame_sum += raw_data[raw_offset++];
++		for(i=0;i<api_frame->api_data->raw_packet.payload_len;i++)
++		{
++			raw_data[raw_offset] = api_frame->api_data->raw_packet.payload[i];
++			frame_sum += raw_data[raw_offset++];
++		}
++		break;
++	case FRAME_TYPE_EXPLICIT_ADDR_CMD:
++		break;
++	case FRAME_TYPE_REMOTE_AT_CMD_REQ:
++		raw_data[raw_offset] = api_frame->api_data->remote_at_cmd_req.api_id;
++		frame_sum += raw_data[raw_offset++];
++		raw_data[raw_offset] = api_frame->api_data->remote_at_cmd_req.frame_id;
++		frame_sum += raw_data[raw_offset++];
++		for(i=0;i<XBEE_ADDR_LEN;i++)
++		{
++			raw_data[raw_offset] = api_frame->api_data->remote_at_cmd_req.dst_addr[i];
++			frame_sum += raw_data[raw_offset++];
++		}
++		raw_data[raw_offset] = api_frame->api_data->remote_at_cmd_req.reserved >> 8 & 0xFF;
++		frame_sum += raw_data[raw_offset++];
++		raw_data[raw_offset] = api_frame->api_data->remote_at_cmd_req.reserved & 0xFF;
++		frame_sum += raw_data[raw_offset++];
++		raw_data[raw_offset] = api_frame->api_data->remote_at_cmd_req.remote_options;
++		frame_sum += raw_data[raw_offset++];
++		raw_data[raw_offset] = api_frame->api_data->remote_at_cmd_req.at_command[0];
++		frame_sum += raw_data[raw_offset++];
++		raw_data[raw_offset] = api_frame->api_data->remote_at_cmd_req.at_command[1];
++		frame_sum += raw_data[raw_offset++];
++		for(i=0;i<api_frame->api_data->remote_at_cmd_req.parameter_value_len;i++)
++		{
++			raw_data[raw_offset] = api_frame->api_data->remote_at_cmd_req.parameter_value[i];
++			frame_sum += raw_data[raw_offset++];
++		}
++		break;
++
++	// Responses
++	case FRAME_TYPE_AT_CMD_RESP:
++		break;
++	case FRAME_TYPE_MODEM_STATUS:
++		break;
++	case FRAME_TYPE_TRANSMIT_STATUS1:
++		break;
++	case FRAME_TYPE_TRANSMIT_STATUS2:
++		break;
++	case FRAME_TYPE_RAW_TRANSMIT_STATUS:
++		break;
++	case FRAME_TYPE_RECEIVE_PACKET:
++		break;
++	case FRAME_TYPE_EXPLICIT_RX_INDICATOR:
++		break;
++	case FRAME_TYPE_NODE_ID_INDICATOR:
++		break;
++	case FRAME_TYPE_REMOTE_CMD_RESP:
++		break;
++	default:
++		printk(KERN_WARNING "%s(): Unknown Type (0x%02X)\n", __func__,api_frame->api_id);
++#ifdef __KERNEL__
++		kfree(raw_data);
++#else
++		free(raw_data);
++#endif
++		*p_len = 0;
++		break;
++		return NULL;
++	}
++	raw_data[raw_offset++] = 0xFF - frame_sum;
++
++	return raw_data;
++}
++
++static int
++_api_frame_should_wait_response(_api_frame_t *api_frame)
++{
++	switch(api_frame->api_id)
++	{
++	// Requests
++	case FRAME_TYPE_AT_CMD:
++		if(api_frame->api_data->at_cmd.frame_id)
++			return api_frame->api_data->at_cmd.frame_id;
++		break;
++	case FRAME_TYPE_AT_CMD_QUEUE:
++		if(api_frame->api_data->at_cmd_queue.frame_id)
++			return api_frame->api_data->at_cmd_queue.frame_id;
++		break;
++	case FRAME_TYPE_TRANSMIT_REQ:
++		if(api_frame->api_data->transmit_req.frame_id)
++			return api_frame->api_data->transmit_req.frame_id;
++		break;
++	case FRAME_TYPE_RAW_TRANSMIT_REQ:
++		if(api_frame->api_data->raw_packet.frame_id)
++			return api_frame->api_data->raw_packet.frame_id;
++		break;
++	case FRAME_TYPE_EXPLICIT_ADDR_CMD:
++		if(api_frame->api_data->explitcit_addr_cmd.frame_id)
++			return api_frame->api_data->explitcit_addr_cmd.frame_id;
++		break;
++	case FRAME_TYPE_REMOTE_AT_CMD_REQ:
++		if(api_frame->api_data->remote_at_cmd_req.frame_id)
++			return api_frame->api_data->remote_at_cmd_req.frame_id;
++		break;
++
++	// Responses
++	case FRAME_TYPE_AT_CMD_RESP:
++		break;
++	case FRAME_TYPE_MODEM_STATUS:
++		break;
++	case FRAME_TYPE_TRANSMIT_STATUS1:
++		break;
++	case FRAME_TYPE_TRANSMIT_STATUS2:
++		break;
++	case FRAME_TYPE_RAW_TRANSMIT_STATUS:
++		break;
++	case FRAME_TYPE_RECEIVE_PACKET:
++		break;
++	case FRAME_TYPE_EXPLICIT_RX_INDICATOR:
++		break;
++	case FRAME_TYPE_NODE_ID_INDICATOR:
++		break;
++	case FRAME_TYPE_REMOTE_CMD_RESP:
++		break;
++	default:
++		printk(KERN_WARNING "%s(): Unknown Type (0x%02X)\n", __func__,api_frame->api_id);
++		break;
++		return 0;
++	}
++	return 0;
++}
++
++static int
++_api_frame_should_signal_pendent(_api_frame_t *api_frame)
++{
++	switch(api_frame->api_id)
++	{
++	// Requests
++	case FRAME_TYPE_AT_CMD:
++		break;
++	case FRAME_TYPE_AT_CMD_QUEUE:
++		break;
++	case FRAME_TYPE_TRANSMIT_REQ:
++		break;
++	case FRAME_TYPE_RAW_TRANSMIT_REQ:
++		break;
++	case FRAME_TYPE_EXPLICIT_ADDR_CMD:
++		break;
++	case FRAME_TYPE_REMOTE_AT_CMD_REQ:
++		break;
++
++	// Responses
++	case FRAME_TYPE_AT_CMD_RESP:
++		if(api_frame->api_data->at_cmd_resp.frame_id)
++			return api_frame->api_data->at_cmd_resp.frame_id;
++		break;
++	case FRAME_TYPE_MODEM_STATUS:
++		return 0;
++		break;
++	case FRAME_TYPE_TRANSMIT_STATUS1:
++		if(api_frame->api_data->transmit_status.frame_id)
++			return api_frame->api_data->transmit_status.frame_id;
++		break;
++	case FRAME_TYPE_TRANSMIT_STATUS2:
++		if(api_frame->api_data->transmit_status2.frame_id)
++			return api_frame->api_data->transmit_status2.frame_id;
++		break;
++	case FRAME_TYPE_RAW_TRANSMIT_STATUS:
++		if(api_frame->api_data->raw_transmit_status.frame_id)
++			return api_frame->api_data->raw_transmit_status.frame_id;
++		break;
++	case FRAME_TYPE_RECEIVE_PACKET:
++		return 0;
++		break;
++	case FRAME_TYPE_EXPLICIT_RX_INDICATOR:
++		return 0;
++		break;
++	case FRAME_TYPE_NODE_ID_INDICATOR:
++		return 0;
++		break;
++	case FRAME_TYPE_REMOTE_CMD_RESP:
++		if(api_frame->api_data->remote_cmd_resp.frame_id)
++			return api_frame->api_data->remote_cmd_resp.frame_id;
++		break;
++	default:
++		printk(KERN_WARNING "%s(): Unknown Type (0x%02X)\n", __func__,api_frame->api_id);
++		break;
++		return 0;
++	}
++	return 0;
++}
++
++static _api_frame_t *
++_api_frame_parse(uint16_t frame_len, uint8_t *raw_data, uint8_t checksum)
++{
++	size_t api_data_size = 0;
++	_api_frame_t *api_frame = NULL;
++	int i = 0;
++	int ni_string_len = 0;
++#ifdef __KERNEL__
++	api_frame = kzalloc(sizeof(_api_frame_t),GFP_KERNEL);
++#else
++	api_frame = calloc(1,sizeof(_api_frame_t));
++#endif
++	if(!api_frame)
++	{
++		printk(KERN_ERR "%s(): unable to allocate memory\n", __func__);
++		_api_frame_free(api_frame);
++		BUG();
++	}
++
++	api_frame->len = frame_len;
++	api_frame->raw_data = raw_data;
++	api_frame->api_id = *(api_frame->raw_data);
++	api_frame->checksum = checksum;
++	api_frame->response = NULL;
++
++	switch(api_frame->api_id)
++	{
++	// Requests
++	case FRAME_TYPE_AT_CMD:
++		api_data_size = sizeof(api_frame_at_cmd_t);
++		break;
++	case FRAME_TYPE_TRANSMIT_REQ:
++		api_data_size = sizeof(api_frame_transmit_req_t);
++		break;
++
++	// Responses
++	case FRAME_TYPE_AT_CMD_RESP:
++		api_data_size = sizeof(api_frame_at_cmd_resp_t);
++		break;
++	case FRAME_TYPE_MODEM_STATUS:
++		api_data_size = sizeof(api_frame_modem_status_t);
++		break;
++	case FRAME_TYPE_TRANSMIT_STATUS1:
++		api_data_size = sizeof(api_frame_transmit_status1_t);
++		break;
++	case FRAME_TYPE_TRANSMIT_STATUS2:
++		api_data_size = sizeof(api_frame_transmit_status2_t);
++		break;
++	case FRAME_TYPE_RAW_TRANSMIT_STATUS:
++		api_data_size = sizeof(api_frame_raw_transmit_status_t);
++		break;
++	case FRAME_TYPE_RECEIVE_PACKET:
++		api_data_size = sizeof(api_frame_receive_packet_t);
++		break;
++	case FRAME_TYPE_EXPLICIT_RX_INDICATOR:
++		api_data_size = sizeof(api_frame_explicit_rx_indicator_t);
++		break;
++	case FRAME_TYPE_NODE_ID_INDICATOR:
++		api_data_size = sizeof(api_frame_node_id_indicator_t);
++		break;
++	case FRAME_TYPE_REMOTE_CMD_RESP:
++		api_data_size = sizeof(api_frame_remote_cmd_resp_t);
++		break;
++
++	// RAW
++	case FRAME_TYPE_RAW_TRANSMIT_REQ:
++		api_data_size = sizeof(api_frame_raw_packet_t);
++		break;
++
++	default:
++		printk(KERN_ERR "%s(): unknown or unimplemented parsing: Type: 0x%02X\n", __func__,api_frame->api_id);
++		print_hex_dump_bytes("xbee_net_rx(): ", DUMP_PREFIX_NONE, raw_data,frame_len);
++		api_frame->raw_data = NULL;
++		_api_frame_free(api_frame);
++		return NULL;
++	}
++
++#ifdef __KERNEL__
++	api_frame->api_data = kzalloc(api_data_size,GFP_KERNEL);
++#else
++	api_frame->api_data = calloc(api_data_size,sizeof(uint8_t));
++#endif
++	if(!api_frame->api_data)
++	{
++		printk(KERN_ERR "%s(): unable to allocate memory\n", __func__);
++		api_frame->raw_data = NULL;
++		_api_frame_free(api_frame);
++		BUG();
++	}
++	switch(api_frame->api_id)
++	{
++	case FRAME_TYPE_AT_CMD:
++		api_frame->api_data->at_cmd.api_id = *(api_frame->raw_data);
++		api_frame->api_data->at_cmd.frame_id = *(api_frame->raw_data+1);
++		api_frame->api_data->at_cmd.at_command[0] = *(api_frame->raw_data+2);
++		api_frame->api_data->at_cmd.at_command[1] = *(api_frame->raw_data+3);
++		api_frame->api_data->at_cmd.parameter_value_len = at_command_get_parameter_len(api_frame);
++		for(i=0;i<api_frame->api_data->at_cmd.parameter_value_len;i++)
++		{
++			api_frame->api_data->at_cmd.parameter_value[i] = *(api_frame->raw_data+4+i);
++		}
++		break;
++	case FRAME_TYPE_TRANSMIT_REQ:
++		api_frame->api_data->transmit_req.api_id = *(api_frame->raw_data);
++		api_frame->api_data->transmit_req.frame_id = *(api_frame->raw_data+1);
++		memcpy(api_frame->api_data->transmit_req.dst_addr, api_frame->raw_data+2, XBEE_ADDR_LEN);
++		api_frame->api_data->transmit_req.reserved = ((*(api_frame->raw_data+10))<<8)+*(api_frame->raw_data+11);
++		api_frame->api_data->transmit_req.brd_radius = *(api_frame->raw_data+12);
++		api_frame->api_data->transmit_req.options = *(api_frame->raw_data+13);
++		api_frame->api_data->transmit_req.payload = api_frame->raw_data+14;
++		api_frame->api_data->transmit_req.payload_len = api_frame->len-14;
++		break;
++
++	// Responses
++	case FRAME_TYPE_AT_CMD_RESP:
++		api_frame->api_data->at_cmd_resp.api_id = *(api_frame->raw_data);
++		api_frame->api_data->at_cmd_resp.frame_id = *(api_frame->raw_data+1);
++		api_frame->api_data->at_cmd_resp.at_command[0] = *(api_frame->raw_data+2);
++		api_frame->api_data->at_cmd_resp.at_command[1] = *(api_frame->raw_data+3);
++		api_frame->api_data->at_cmd_resp.cmd_status = *(api_frame->raw_data+4);
++		api_frame->api_data->at_cmd_resp.cmd_data_len = at_command_get_parameter_len(api_frame);
++		for(i=0;i<api_frame->api_data->at_cmd_resp.cmd_data_len;i++)
++		{
++			api_frame->api_data->at_cmd_resp.cmd_data[i] = *(api_frame->raw_data+5+i);
++		}
++		break;
++	case FRAME_TYPE_MODEM_STATUS:
++		api_frame->api_data->modem_status.api_id = *(api_frame->raw_data);
++		api_frame->api_data->modem_status.status = *(api_frame->raw_data+1);
++		break;
++	case FRAME_TYPE_TRANSMIT_STATUS1:
++		api_frame->api_data->transmit_status.api_id = *(api_frame->raw_data);
++		api_frame->api_data->transmit_status.frame_id = *(api_frame->raw_data+1);
++		api_frame->api_data->transmit_status.reserved = ((*(api_frame->raw_data+2))<<8)+*(api_frame->raw_data+3);
++		api_frame->api_data->transmit_status.transmit_retry_count = *(api_frame->raw_data+4);
++		api_frame->api_data->transmit_status.delivery_status = *(api_frame->raw_data+5);
++		api_frame->api_data->transmit_status.discovery_status = *(api_frame->raw_data+6);
++		break;
++	case FRAME_TYPE_TRANSMIT_STATUS2:
++		api_frame->api_data->transmit_status2.api_id = *(api_frame->raw_data);
++		api_frame->api_data->transmit_status2.frame_id = *(api_frame->raw_data+1);
++		api_frame->api_data->transmit_status2.delivery_status = *(api_frame->raw_data+2);
++		break;
++	case FRAME_TYPE_RECEIVE_PACKET:
++		api_frame->api_data->receive_packet.api_id = *(api_frame->raw_data);
++		memcpy(api_frame->api_data->receive_packet.src_addr, api_frame->raw_data+1, XBEE_ADDR_LEN);
++		api_frame->api_data->receive_packet.reserved = ((*(api_frame->raw_data+9))<<8)+*(api_frame->raw_data+10);
++		api_frame->api_data->receive_packet.options = *(api_frame->raw_data+11);
++		//api_frame->api_data->receive_packet.split_header = *(api_frame->raw_data+12);
++		api_frame->api_data->receive_packet.payload = api_frame->raw_data+12;
++		api_frame->api_data->receive_packet.payload_len = api_frame->len-12;
++		break;
++	case FRAME_TYPE_EXPLICIT_RX_INDICATOR:
++		api_frame->api_data->explicit_rx_indicator.api_id = *(api_frame->raw_data);
++		memcpy(api_frame->api_data->explicit_rx_indicator.src_addr, api_frame->raw_data+1, XBEE_ADDR_LEN);
++		api_frame->api_data->explicit_rx_indicator.reserved = ((*(api_frame->raw_data+9))<<8)+*(api_frame->raw_data+10);
++		api_frame->api_data->explicit_rx_indicator.src_endpoint = *(api_frame->raw_data+11);
++		api_frame->api_data->explicit_rx_indicator.dst_endpoint = *(api_frame->raw_data+12);
++		api_frame->api_data->explicit_rx_indicator.cluster_id = ((*(api_frame->raw_data+13))<<8)+*(api_frame->raw_data+14);
++		api_frame->api_data->explicit_rx_indicator.profile_id = ((*(api_frame->raw_data+15))<<8)+*(api_frame->raw_data+16);
++		api_frame->api_data->explicit_rx_indicator.options = *(api_frame->raw_data+17);
++		api_frame->api_data->explicit_rx_indicator.payload = api_frame->raw_data+18;
++		api_frame->api_data->explicit_rx_indicator.payload_len = api_frame->len-18;
++		break;
++	case FRAME_TYPE_NODE_ID_INDICATOR:
++		api_frame->api_data->node_id_indicator.api_id = *(api_frame->raw_data);
++		memcpy(api_frame->api_data->node_id_indicator.sender_addr, api_frame->raw_data+1, XBEE_ADDR_LEN);
++		api_frame->api_data->node_id_indicator.sender_short_addr = ((*(api_frame->raw_data+9))<<8)+*(api_frame->raw_data+10);
++		api_frame->api_data->node_id_indicator.options = *(api_frame->raw_data+11);
++		api_frame->api_data->node_id_indicator.src_short_addr = ((*(api_frame->raw_data+12))<<8)+*(api_frame->raw_data+13);
++		memcpy(api_frame->api_data->node_id_indicator.src_addr, api_frame->raw_data+14, XBEE_ADDR_LEN);
++		api_frame->api_data->node_id_indicator.ni_string = api_frame->raw_data+22;
++		ni_string_len = strlen((char*)api_frame->api_data->node_id_indicator.ni_string);
++		api_frame->api_data->node_id_indicator.parent_short_addr = ((*(api_frame->raw_data+22+ni_string_len+1))<<8)+*(api_frame->raw_data+23+ni_string_len+1);
++		break;
++	case FRAME_TYPE_REMOTE_CMD_RESP:
++		api_frame->api_data->remote_cmd_resp.api_id = *(api_frame->raw_data);
++		api_frame->api_data->remote_cmd_resp.frame_id = *(api_frame->raw_data+1);
++		memcpy(api_frame->api_data->remote_cmd_resp.src_addr, api_frame->raw_data+2, XBEE_ADDR_LEN);
++		api_frame->api_data->remote_cmd_resp.reserved = ((*(api_frame->raw_data+10))<<8)+*(api_frame->raw_data+11);
++		api_frame->api_data->remote_cmd_resp.at_command[0] = *(api_frame->raw_data+12);
++		api_frame->api_data->remote_cmd_resp.at_command[1] = *(api_frame->raw_data+13);
++		api_frame->api_data->remote_cmd_resp.cmd_status = *(api_frame->raw_data+14);
++		api_frame->api_data->remote_cmd_resp.cmd_data_len = at_command_get_parameter_len(api_frame);
++		for(i=0;i<api_frame->api_data->remote_cmd_resp.cmd_data_len;i++)
++		{
++			api_frame->api_data->remote_cmd_resp.cmd_data[i] = *(api_frame->raw_data+15+i);
++		}
++		break;
++
++	// RAW packet
++	// case FRAME_TYPE_RAW_RECEIVE:
++	case FRAME_TYPE_RAW_TRANSMIT_REQ:
++		api_frame->api_data->raw_packet.api_id = *(api_frame->raw_data);
++		api_frame->api_data->raw_packet.frame_id = *(api_frame->raw_data+1); // this is the LQI on RAW received
++		api_frame->api_data->raw_packet.payload = api_frame->raw_data+2;
++		api_frame->api_data->raw_packet.payload_len = api_frame->len-2;
++		break;
++
++	case FRAME_TYPE_RAW_TRANSMIT_STATUS:
++		api_frame->api_data->raw_transmit_status.api_id = *(api_frame->raw_data);
++		api_frame->api_data->raw_transmit_status.frame_id = *(api_frame->raw_data+1);
++		api_frame->api_data->raw_transmit_status.retries = *(api_frame->raw_data+2);
++		api_frame->api_data->raw_transmit_status.delivery_status = *(api_frame->raw_data+3);
++		break;
++
++	default:
++		printk(KERN_ERR "%s(): unknown or unimplemented parsing #2: Type: 0x%02X\n", __func__,api_frame->api_id);
++		api_frame->raw_data = NULL;
++		_api_frame_free(api_frame);
++		return NULL;
++	}
++
++#ifdef __KERNEL__
++	mutex_init(&api_frame->mutex);
++#else
++	pthread_mutex_init(&api_frame->mutex,NULL);
++	pthread_cond_init(&api_frame->complete,NULL);
++#endif
++
++#ifndef __KERNEL__
++#ifdef	DEBUG
++	printk(KERN_DEBUG "%s(): new frame %"PRIu16" bytes length: cmdID: 0x%02X\n",
++			__func__,api_frame->len,api_frame->api_id);
++#endif
++#endif
++
++	return api_frame;
++}
++
++static void
++_api_frame_free(_api_frame_t *api_frame)
++{
++	if(!api_frame)
++	{
++		printk(KERN_ERR "%s: api frame NULL pointer\n", __func__);
++		BUG();
++	}
++
++	if(api_frame->response)
++	{
++		_api_frame_free(api_frame->response);
++	}
++
++	if(api_frame->api_data)
++	{
++#ifdef __KERNEL__
++		kfree(api_frame->api_data);
++#else
++		free(api_frame->api_data);
++#endif
++		api_frame->api_data = NULL;
++	}
++	if(api_frame->raw_data)
++	{
++#ifdef __KERNEL__
++		kfree(api_frame->raw_data);
++#else
++		free(api_frame->raw_data);
++#endif
++		api_frame->raw_data = NULL;
++	}
++
++#ifndef __KERNEL__
++	pthread_mutex_destroy(&api_frame->mutex);
++#endif
++
++#ifndef __KERNEL__
++	pthread_cond_destroy(&api_frame->complete);
++#endif
++
++#ifdef __KERNEL__
++	kfree(api_frame);
++#else
++	free(api_frame);
++#endif
++	api_frame = NULL;
++}
++
++static void
++_api_frame_print(_api_frame_t *api_frame)
++{
++#ifdef DEBUG
++	char str_aux[20] = {};
++	//123456789012345678901234
++	//AA:BB:CC:DD:EE:FF:11:22
++	char eui64_addr_str[24] = {};
++	int i = 0;
++
++	if(!api_frame)
++	{
++		printk(KERN_DEBUG "%s: api frame NULL pointer\n", __func__);
++		return;
++	}
++	printk(KERN_DEBUG "%s(): ______________________________________________________\n", __func__);
++	switch(api_frame->api_id)
++	{
++	case FRAME_TYPE_AT_CMD:
++		printk(KERN_DEBUG "%s(): Type: AT Command\n", __func__);
++		printk(KERN_DEBUG "%s(): FrameID: %d\n", __func__,api_frame->api_data->at_cmd.frame_id);
++		printk(KERN_DEBUG "%s(): Command: %c%c\n", __func__,api_frame->api_data->at_cmd.at_command[0],api_frame->api_data->at_cmd.at_command[1]);
++		printk(KERN_DEBUG "%s(): Parameter: %s\n", __func__,at_command_get_parameter_str(api_frame,str_aux));
++		break;
++	case FRAME_TYPE_AT_CMD_QUEUE:
++		printk(KERN_DEBUG "%s(): AT Command Queue Type\n", __func__);
++		printk(KERN_DEBUG "%s(): FrameID: %d\n", __func__,api_frame->api_data->at_cmd.frame_id);
++		printk(KERN_DEBUG "%s(): Command: %c%c\n", __func__,api_frame->api_data->at_cmd.at_command[0],api_frame->api_data->at_cmd.at_command[1]);
++		printk(KERN_DEBUG "%s(): Parameter: %s\n", __func__,at_command_get_parameter_str(api_frame,str_aux));
++		break;
++	case FRAME_TYPE_TRANSMIT_REQ:
++		printk(KERN_DEBUG "%s(): Type: Transmit Request\n", __func__);
++		printk(KERN_DEBUG "%s(): FrameID: %d\n", __func__,api_frame->api_data->transmit_req.frame_id);
++		printk(KERN_DEBUG "%s(): Dst Addr: %s\n", __func__,eui64_address_to_str(api_frame->api_data->transmit_req.dst_addr,eui64_addr_str));
++		printk(KERN_DEBUG "%s(): Reserved: %04X\n", __func__,api_frame->api_data->transmit_req.reserved);
++		printk(KERN_DEBUG "%s(): BroadcastRadius: %d\n", __func__,api_frame->api_data->transmit_req.brd_radius);
++		if(api_frame->api_data->transmit_req.options & 0x01)
++			printk(KERN_DEBUG "%s(): Ack Disabled\n", __func__);
++		if(api_frame->api_data->transmit_req.options & 0x02)
++			printk(KERN_DEBUG "%s(): Don't attempt route Discovery\n", __func__);
++		printk(KERN_DEBUG "%s(): Payload Lenght: %d\n", __func__,api_frame->api_data->transmit_req.payload_len);
++		printk(KERN_DEBUG "%s(): Payload: ", __func__);
++		for(i = 0;i<api_frame->api_data->transmit_req.payload_len;i++){
++			printk("%02X ",api_frame->api_data->transmit_req.payload[i]);
++		}
++		printk("\n");
++		break;
++	case FRAME_TYPE_RAW_PACKET:
++		printk(KERN_DEBUG "%s(): Type: Raw Packet\n", __func__);
++		printk(KERN_DEBUG "%s(): Payload Lenght: %d\n", __func__,api_frame->api_data->raw_packet.payload_len);
++		printk(KERN_DEBUG "%s(): Payload: ", __func__);
++		for(i = 0;i<api_frame->api_data->raw_packet.payload_len;i++){
++			printk("%02X ",api_frame->api_data->raw_packet.payload[i]);
++		}
++		printk("\n");
++		break;
++	case FRAME_TYPE_EXPLICIT_ADDR_CMD:
++		printk(KERN_DEBUG "%s(): Type: Explicit Addressing Command\n", __func__);
++		break;
++	case FRAME_TYPE_REMOTE_AT_CMD_REQ:
++		printk(KERN_DEBUG "%s(): Type: Remote AT Command Request\n", __func__);
++		break;
++	case FRAME_TYPE_AT_CMD_RESP:
++		printk(KERN_DEBUG "%s(): Type: AT Command Response\n", __func__);
++		printk(KERN_DEBUG "%s(): FrameID: %d\n", __func__,api_frame->api_data->at_cmd_resp.frame_id);
++		printk(KERN_DEBUG "%s(): Command: %c%c\n", __func__,api_frame->api_data->at_cmd_resp.at_command[0],api_frame->api_data->at_cmd_resp.at_command[1]);
++		switch(api_frame->api_data->at_cmd_resp.cmd_status)
++		{
++		case 0x00:
++			printk(KERN_DEBUG "%s(): Command Status: OK\n", __func__);
++			break;
++		case 0x01:
++			printk(KERN_DEBUG "%s(): Command Status: Error\n", __func__);
++			break;
++		case 0x02:
++			printk(KERN_DEBUG "%s(): Command Status: Invalid Command\n", __func__);
++			break;
++		case 0x03:
++			printk(KERN_DEBUG "%s(): Command Status: Invalid Parameter\n", __func__);
++			break;
++		default:
++			printk(KERN_DEBUG "%s(): Command Status: Unknown status 0x%02X\n", __func__,api_frame->api_data->at_cmd_resp.cmd_status);
++			break;
++		}
++		if(api_frame->api_data->at_cmd_resp.cmd_data_len)
++			printk(KERN_DEBUG "%s(): Parameter: %s\n", __func__,at_command_get_parameter_str(api_frame,str_aux));
++		break;
++	case FRAME_TYPE_MODEM_STATUS:
++		printk(KERN_DEBUG "%s(): Type: Modem Status\n", __func__);
++		switch(api_frame->api_data->modem_status.status)
++		{
++		case 0x00:
++			printk(KERN_DEBUG "%s(): Status: Hardware reset\n", __func__);
++			break;
++		case 0x01:
++			printk(KERN_DEBUG "%s(): Status: Watchdog time reset\n", __func__);
++			break;
++		case 0x0B:
++			printk(KERN_DEBUG "%s(): Status: Network Woke Up\n", __func__);
++			break;
++		case 0x0C:
++			printk(KERN_DEBUG "%s(): Status: Network Went To Sleep\n", __func__);
++			break;
++		default:
++			printk(KERN_DEBUG "%s(): Status: Unknown (0x%02X)\n", __func__,api_frame->api_data->modem_status.status);
++			break;
++		}
++		break;
++	case FRAME_TYPE_TRANSMIT_STATUS1:
++			printk(KERN_DEBUG "%s(): Type: Transmit Status\n", __func__);
++			printk(KERN_DEBUG "%s(): FrameID: %d\n", __func__,api_frame->api_data->transmit_status.frame_id);
++			printk(KERN_DEBUG "%s(): Reserved: %04X\n", __func__,api_frame->api_data->transmit_status.reserved);
++			printk(KERN_DEBUG "%s(): Transmit Retry Count: %d\n", __func__,api_frame->api_data->transmit_status.transmit_retry_count);
++			switch(api_frame->api_data->transmit_status.delivery_status)
++			{
++			case 0x00:
++				printk(KERN_DEBUG "%s(): Delivery Status: Success\n", __func__);
++				break;
++			case 0x01:
++				printk(KERN_DEBUG "%s(): Delivery Status: MAC ACK Failure\n", __func__);
++				break;
++			case 0x15:
++				printk(KERN_DEBUG "%s(): Delivery Status: Invalid destination endpoint\n", __func__);
++				break;
++			case 0x21:
++				printk(KERN_DEBUG "%s(): Delivery Status: Network ACK Failure\n", __func__);
++				break;
++			case 0x25:
++				printk(KERN_DEBUG "%s(): Delivery Status: Route Not Found\n", __func__);
++				break;
++			default:
++				printk(KERN_DEBUG "%s(): Delivery Status: Unknown (0x%02X)\n", __func__,api_frame->api_data->transmit_status.delivery_status);
++				break;
++			}
++			switch(api_frame->api_data->transmit_status.discovery_status)
++			{
++			case 0x00:
++				printk(KERN_DEBUG "%s(): Discovery Status: No Discovery Overhead\n", __func__);
++				break;
++			case 0x02:
++				printk(KERN_DEBUG "%s(): Discovery Status: Route Discovery\n", __func__);
++				break;
++			default:
++				printk(KERN_DEBUG "%s(): Discovery Status: Unknown (0x%02X)\n", __func__,api_frame->api_data->transmit_status.discovery_status);
++				break;
++			}
++			break;
++	case FRAME_TYPE_TRANSMIT_STATUS2:
++		printk(KERN_DEBUG "%s(): Type: Transmit Status 2\n", __func__);
++		printk(KERN_DEBUG "%s(): FrameID: %d\n", __func__,api_frame->api_data->transmit_status2.frame_id);
++		switch(api_frame->api_data->transmit_status2.delivery_status)
++		{
++		case 0x00:
++			printk(KERN_DEBUG "%s(): Success, no errors were detected on transmission.\n", __func__);
++			break;
++		case 0x01:
++			printk(KERN_DEBUG "%s(): An expected MAC acknowledgement never occurred.\n", __func__);
++			break;
++		case 0x02:
++			printk(KERN_DEBUG "%s(): CCA failure.\n", __func__);
++			break;
++		case 0x03:
++			printk(KERN_DEBUG "%s(): Transmission was purged because it was attempted before the stack was up.\n", __func__);
++			break;
++		case 0x04:
++			printk(KERN_DEBUG "%s(): Physical error occurred on the interface with the WiFi transceiver.\n", __func__);
++			break;
++		case 0x18:
++			printk(KERN_DEBUG "%s(): No Buffers.\n", __func__);
++			break;
++		case 0x21:
++			printk(KERN_DEBUG "%s(): An expected network acknowledgement never occurred.\n", __func__);
++			break;
++		case 0x22:
++			printk(KERN_DEBUG "%s(): Not joined to network.\n", __func__);
++			break;
++		case 0x23:
++			printk(KERN_DEBUG "%s(): Self-addressed.\n", __func__);
++			break;
++		case 0x24:
++			printk(KERN_DEBUG "%s(): Address not found.\n", __func__);
++			break;
++		case 0x25:
++			printk(KERN_DEBUG "%s(): Route not found.\n", __func__);
++			break;
++		case 0x26:
++			printk(KERN_DEBUG "%s(): Broadcast relay was not heard.\n", __func__);
++			break;
++		case 0x2B:
++			printk(KERN_DEBUG "%s(): Invalid Binding Table Index.\n", __func__);
++			break;
++		case 0x2C:
++			printk(KERN_DEBUG "%s(): Invalid Endpoint.\n", __func__);
++			break;
++		case 0x31:
++			printk(KERN_DEBUG "%s(): A software error occurred.\n", __func__);
++			break;
++		case 0x32:
++			printk(KERN_DEBUG "%s(): Resource Error.\n", __func__);
++			break;
++		case 0x74:
++			printk(KERN_DEBUG "%s(): Data payload too large.\n", __func__);
++			break;
++		case 0x76:
++			printk(KERN_DEBUG "%s(): Attempt to create a client socket failed.\n", __func__);
++			break;
++		case 0xBB:
++			printk(KERN_DEBUG "%s(): Key not authorized.\n", __func__);
++			break;
++		default:
++			printk(KERN_DEBUG "%s(): Delivery Status: Unknown (0x%02X)\n", __func__,api_frame->api_data->transmit_status2.delivery_status);
++			break;
++		}
++		break;
++	case FRAME_TYPE_RECEIVE_PACKET:
++		printk(KERN_DEBUG "%s(): Type: Receive Packet\n", __func__);
++		printk(KERN_DEBUG "%s(): Src Addr: %s\n", __func__,eui64_address_to_str(api_frame->api_data->receive_packet.src_addr,eui64_addr_str));
++		printk(KERN_DEBUG "%s(): Reserved: %04X\n", __func__,api_frame->api_data->receive_packet.reserved);
++		if(api_frame->api_data->receive_packet.options & 0x01)
++			printk(KERN_DEBUG "%s(): Packet Acknowleged\n", __func__);
++		if(api_frame->api_data->receive_packet.options & 0x02)
++			printk(KERN_DEBUG "%s(): Packet was broadcast packet\n", __func__);
++		printk(KERN_DEBUG "%s(): Payload Lenght: %d\n", __func__,api_frame->api_data->receive_packet.payload_len);
++		printk(KERN_DEBUG "%s(): Payload: ", __func__);
++		for(i = 0;i<api_frame->api_data->receive_packet.payload_len;i++){
++			printk("%02X ",api_frame->api_data->receive_packet.payload[i]);
++		}
++		printk("\n");
++
++		break;
++	case FRAME_TYPE_EXPLICIT_RX_INDICATOR:
++		printk(KERN_DEBUG "%s(): Type: Explitict RX Indicator\n", __func__);
++		printk(KERN_DEBUG "%s(): Src Addr: %s\n", __func__,eui64_address_to_str(api_frame->api_data->explicit_rx_indicator.src_addr,eui64_addr_str));
++		printk(KERN_DEBUG "%s(): Reserved: %04X\n", __func__,api_frame->api_data->explicit_rx_indicator.reserved);
++		printk(KERN_DEBUG "%s(): Src Endpoint: 0x%02X\n", __func__,api_frame->api_data->explicit_rx_indicator.src_endpoint);
++		printk(KERN_DEBUG "%s(): Dst Endpoint: 0x%02X\n", __func__,api_frame->api_data->explicit_rx_indicator.dst_endpoint);
++		printk(KERN_DEBUG "%s(): ClusterID: %04X\n", __func__,api_frame->api_data->explicit_rx_indicator.cluster_id);
++		printk(KERN_DEBUG "%s(): ProfileID: %04X\n", __func__,api_frame->api_data->explicit_rx_indicator.profile_id);
++		if(api_frame->api_data->explicit_rx_indicator.options & 0x01)
++			printk(KERN_DEBUG "%s(): Packet Acknowleged\n", __func__);
++		if(api_frame->api_data->explicit_rx_indicator.options & 0x02)
++			printk(KERN_DEBUG "%s(): Packet was broadcast packet\n", __func__);
++		printk(KERN_DEBUG "%s(): Payload Lenght: %d\n", __func__,api_frame->api_data->explicit_rx_indicator.payload_len);
++		printk(KERN_DEBUG "%s(): Payload: ", __func__);
++		for(i = 0;i<api_frame->api_data->explicit_rx_indicator.payload_len;i++){
++			printk("%02X ",api_frame->api_data->explicit_rx_indicator.payload[i]);
++		}
++		printk("\n");
++
++		break;
++	case FRAME_TYPE_NODE_ID_INDICATOR:
++		printk(KERN_DEBUG "%s(): Type: Node Identification Indicator\n", __func__);
++		printk(KERN_DEBUG "%s(): Sender Addr: %s\n", __func__,eui64_address_to_str(api_frame->api_data->node_id_indicator.sender_addr,eui64_addr_str));
++		printk(KERN_DEBUG "%s(): Sender Short Addr: %04X\n", __func__,api_frame->api_data->node_id_indicator.sender_short_addr);
++		if(api_frame->api_data->node_id_indicator.options & 0x01)
++			printk(KERN_DEBUG "%s(): Packet Acknowleged\n", __func__);
++		if(api_frame->api_data->node_id_indicator.options & 0x02)
++			printk(KERN_DEBUG "%s(): Packet was broadcast packet\n", __func__);
++		printk(KERN_DEBUG "%s(): Remote Short Addr: %04X\n", __func__,api_frame->api_data->node_id_indicator.src_short_addr);
++		printk(KERN_DEBUG "%s(): Remote Addr: %s\n", __func__,eui64_address_to_str(api_frame->api_data->node_id_indicator.src_addr,eui64_addr_str));
++		printk(KERN_DEBUG "%s(): Ni: \"%s\"\n", __func__,api_frame->api_data->node_id_indicator.ni_string);
++		printk(KERN_DEBUG "%s(): Remote Short Addr: %04X\n", __func__,api_frame->api_data->node_id_indicator.parent_short_addr);
++
++		break;
++	case FRAME_TYPE_REMOTE_CMD_RESP:
++		printk(KERN_DEBUG "%s(): Type: Remote Command Response\n", __func__);
++		printk(KERN_DEBUG "%s(): FrameID: %d\n", __func__,api_frame->api_data->remote_cmd_resp.frame_id);
++		printk(KERN_DEBUG "%s(): Src Addr: %s\n", __func__,eui64_address_to_str(api_frame->api_data->remote_cmd_resp.src_addr,eui64_addr_str));
++		printk(KERN_DEBUG "%s(): Reserved: %04X\n", __func__,api_frame->api_data->remote_cmd_resp.reserved);
++		printk(KERN_DEBUG "%s(): Command: %c%c\n", __func__,api_frame->api_data->remote_cmd_resp.at_command[0],api_frame->api_data->remote_cmd_resp.at_command[1]);
++		switch(api_frame->api_data->remote_cmd_resp.cmd_status)
++		{
++		case 0x00:
++			printk(KERN_DEBUG "%s(): Command Status: OK\n", __func__);
++			break;
++		case 0x01:
++			printk(KERN_DEBUG "%s(): Command Status: Error\n", __func__);
++			break;
++		case 0x02:
++			printk(KERN_DEBUG "%s(): Command Status: Invalid Command\n", __func__);
++			break;
++		case 0x03:
++			printk(KERN_DEBUG "%s(): Command Status: Invalid Parameter\n", __func__);
++			break;
++		default:
++			printk(KERN_DEBUG "%s(): Command Status: Unknown status 0x%02X\n", __func__,api_frame->api_data->remote_cmd_resp.cmd_status);
++			break;
++		}
++		if(api_frame->api_data->remote_cmd_resp.cmd_data_len)
++			printk(KERN_DEBUG "%s(): Parameter: %s\n", __func__,at_command_get_parameter_str(api_frame,str_aux));
++
++		break;
++	default:
++		printk(KERN_DEBUG "%s(): Type: Unknown (0x%02X)\n", __func__,api_frame->api_id);
++		break;
++	}
++
++	printk(KERN_DEBUG "%s(): ______________________________________________________\n", __func__);
++#endif
++}
++
++
++/*
++ * Escape helpers
++ */
++static int
++escape_required(uint8_t c)
++{
++	return ((XBEE_START_DELIM == c) ||
++			(XBEE_ESCAPE == c) ||
++			(XBEE_XON == c) ||
++			(XBEE_XOFF == c));
++}
++static int
++unescape_required(uint8_t c)
++{
++	return (XBEE_ESCAPE == c);
++}
++
++/*
++ * Received data processing
++ */
++
++static int
++_api_frame_process_response(_api_frame_t *api_frame)
++{
++	if(api_frame == NULL)
++	{
++		printk(KERN_ERR "%s: api_frame NULL pointer\n", __func__);
++		BUG();
++	}
++	pr_debug("%s(): api_frame request 0x%02X with response 0x%02X\n", __func__,api_frame->api_id,api_frame->response->api_id);
++	switch(api_frame->api_id)
++	{
++	// Requests
++	case FRAME_TYPE_AT_CMD:
++		if(api_frame->response->api_id != FRAME_TYPE_AT_CMD_RESP)
++		{
++			printk(KERN_WARNING "%s: invalid response type: 0x%02X (expected 0x%02X)\n", __func__,api_frame->response->api_id,FRAME_TYPE_AT_CMD_RESP);
++			return -EINVAL;
++		}
++		if(api_frame->response->api_data->at_cmd_resp.cmd_status != 0)
++		{
++			printk(KERN_DEBUG "%s: error issuing AT command: 0x%02X\n", __func__,api_frame->response->api_data->at_cmd_resp.cmd_status);
++			return -EINVAL;
++		}
++		break;
++	case FRAME_TYPE_AT_CMD_QUEUE:
++		if(api_frame->response->api_id != FRAME_TYPE_AT_CMD_RESP)
++		{
++			printk(KERN_WARNING "%s: invalid response type: 0x%02X (expected 0x%02X)\n", __func__,api_frame->response->api_id,FRAME_TYPE_AT_CMD_RESP);
++			return -EINVAL;
++		}
++		if(api_frame->response->api_data->at_cmd_resp.cmd_status != 0)
++		{
++			printk(KERN_DEBUG "%s: error issuing AT command: 0x%02X\n", __func__,api_frame->response->api_data->at_cmd_resp.cmd_status);
++			return -EINVAL;
++		}
++		break;
++	case FRAME_TYPE_TRANSMIT_REQ:
++		if(api_frame->response->api_id != FRAME_TYPE_TRANSMIT_STATUS1 && api_frame->response->api_id != FRAME_TYPE_TRANSMIT_STATUS2)
++		{
++			printk(KERN_WARNING "%s: invalid response type: 0x%02X (expected 0x%02X)\n", __func__,api_frame->response->api_id,FRAME_TYPE_TRANSMIT_STATUS1);
++			return -EINVAL;
++		}
++		if(api_frame->response->api_data->transmit_status.delivery_status)
++		{
++			printk(KERN_DEBUG "%s: error transmitting data: 0x%02X retries: %d disc: 0x%02X\n", __func__,
++					api_frame->response->api_data->transmit_status.delivery_status,
++					api_frame->response->api_data->transmit_status.transmit_retry_count,
++					api_frame->response->api_data->transmit_status.discovery_status);
++			return -EAGAIN;
++		}
++		break;
++
++	case FRAME_TYPE_RAW_TRANSMIT_REQ:
++		if(api_frame->response->api_id != FRAME_TYPE_RAW_TRANSMIT_STATUS)
++		{
++			printk(KERN_WARNING "%s: invalid response type: 0x%02X (expected 0x%02X)\n", __func__,api_frame->response->api_id,FRAME_TYPE_RAW_TRANSMIT_STATUS);
++			return -EINVAL;
++		}
++		if(api_frame->response->api_data->raw_transmit_status.delivery_status)
++		{
++			printk(KERN_DEBUG "%s: error transmitting data: 0x%02X\n", __func__,
++					api_frame->response->api_data->raw_transmit_status.delivery_status);
++			return -EAGAIN;
++		}
++		break;
++
++	case FRAME_TYPE_EXPLICIT_ADDR_CMD:
++		if(api_frame->response->api_id != FRAME_TYPE_TRANSMIT_STATUS1 && api_frame->response->api_id != FRAME_TYPE_TRANSMIT_STATUS2)
++		{
++			printk(KERN_WARNING "%s: invalid response type: 0x%02X (expected 0x%02X)\n", __func__,api_frame->response->api_id,FRAME_TYPE_TRANSMIT_STATUS1);
++			return -EINVAL;
++		}
++		if(api_frame->response->api_data->transmit_status.delivery_status)
++		{
++			printk(KERN_DEBUG "%s: error transmitting data: 0x%02X\n", __func__,api_frame->response->api_data->transmit_status.delivery_status);
++			return -EAGAIN;
++		}
++		break;
++	case FRAME_TYPE_REMOTE_AT_CMD_REQ:
++		if(api_frame->response->api_id != FRAME_TYPE_REMOTE_CMD_RESP)
++		{
++			printk(KERN_WARNING "%s: invalid response type: 0x%02X (expected 0x%02X)\n", __func__,api_frame->response->api_id,FRAME_TYPE_REMOTE_CMD_RESP);
++			return -EINVAL;
++		}
++		if(api_frame->response->api_data->remote_cmd_resp.cmd_status != 0)
++		{
++			printk(KERN_DEBUG "%s: error issuing AT command: 0x%02X\n", __func__,api_frame->response->api_data->remote_cmd_resp.cmd_status);
++			return -EINVAL;
++		}
++		break;
++
++	// Responses
++//	case FRAME_TYPE_AT_CMD_RESP:
++//		return 1;
++//		break;
++//	case FRAME_TYPE_MODEM_STATUS:
++//		return 1;
++//		break;
++//	case FRAME_TYPE_TRANSMIT_STATUS:
++//		return 1;
++//		break;
++//	case FRAME_TYPE_RECEIVE_PACKET:
++//		return 1;
++//		break;
++//	case FRAME_TYPE_EXPLICIT_RX_INDICATOR:
++//		return 1;
++//		break;
++//	case FRAME_TYPE_NODE_ID_INDICATOR:
++//		return 1;
++//		break;
++//	case FRAME_TYPE_REMOTE_CMD_RESP:
++//		return 1;
++//		break;
++	default:
++		printk(KERN_WARNING "%s(): Invalid Request Type (0x%02X)\n", __func__,api_frame->api_id);
++		break;
++		return 0;
++	}
++	return 0;
++}
++
++static void
++ieee802154_net_rx(struct xbee_device *xbee_dev, _api_frame_t *api_frame);
++
++static int
++_api_frame_process(struct xbee_device *xbee_dev, _api_frame_t *api_frame)
++{
++	int ret = 0;
++	if(xbee_dev == NULL)
++	{
++		printk(KERN_ERR "%s: xbee_dev NULL pointer\n", __func__);
++		BUG();
++	}
++	if(api_frame == NULL)
++	{
++		printk(KERN_ERR "%s: api_frame NULL pointer\n", __func__);
++		BUG();
++	}
++
++#ifdef	DEBUG
++	printk(KERN_INFO "%s(): Call process frame\n", __func__);
++#endif
++
++	//_api_frame_print(api_frame);
++
++	if(_api_frame_should_signal_pendent(api_frame))
++	{
++		xbee_device_signal_pendent_req(xbee_dev,api_frame);
++	}
++	else
++	{
++		//TODO: not pendent request response
++		_api_frame_print(api_frame);
++
++		//FIXME we should only push to stack the received_packets frames or RAW
++		ieee802154_net_rx(xbee_dev,api_frame);
++
++		_api_frame_free(api_frame);
++		api_frame = NULL;
++	}
++
++	return ret;
++}
++
++static int
++xbee_process_char(struct xbee_device *xbee_dev, unsigned char c)
++{
++	_api_frame_t *api_frame = NULL;
++//#ifdef	DEBUG
++//	printk(KERN_INFO "%s(): current state %s\n", __func__,
++//			xbee_recv_state_str(xbee_dev->recv_state));
++//
++//	printk(KERN_INFO "%s(): processing %3d (0x%02X)\n", __func__,c,c);
++//#endif
++
++	/* Data processing */
++	switch (xbee_dev->recv_state) {
++	case RECV_STATE_WAIT_START_DELIM:
++		if (XBEE_START_DELIM == c)
++		{
++			xbee_dev->recv_state = RECV_STATE_WAIT_MSB;
++		}
++		break;
++	case RECV_STATE_WAIT_MSB:
++		xbee_dev->recv_data_size = c;
++		xbee_dev->recv_state = RECV_STATE_WAIT_LSB;
++		break;
++	case RECV_STATE_WAIT_LSB:
++
++		if(xbee_dev->recv_data)
++		{
++			printk(KERN_INFO "%s(): we shouldnt get data buffers here!\n",__func__);
++		}
++
++		xbee_dev->recv_data_size <<= 8;
++		xbee_dev->recv_data_size += c;
++		xbee_dev->recv_state = RECV_STATE_WAIT_DATA;
++
++#ifdef __KERNEL__
++		xbee_dev->recv_data = kzalloc(xbee_dev->recv_data_size, GFP_KERNEL);
++#else
++		xbee_dev->recv_data = calloc(xbee_dev->recv_data_size,sizeof(uint8_t));
++#endif
++		if (!xbee_dev->recv_data) {
++			printk(KERN_ERR "%s(): unable to allocate memory\n", __func__);
++			xbee_dev->recv_data_size = 0;
++			return -ENOMEM;
++		}
++
++		xbee_dev->recv_data_offset = 0;
++		xbee_dev->recv_data_sum = 0;
++
++#ifndef __KERNEL__
++#ifdef	DEBUG
++		printk(KERN_INFO "%s(): Got payload length: %"PRIu16"\n", __func__,xbee_dev->recv_data_size);
++#endif
++#endif
++
++		break;
++	case RECV_STATE_WAIT_DATA:
++//#ifdef	DEBUG
++//		printk(KERN_INFO "%s(): processing: index data[%u]\n", __func__,xbee_dev->recv_data_offset);
++//#endif
++		xbee_dev->recv_data_sum += c;
++		xbee_dev->recv_data[xbee_dev->recv_data_offset++] = c;
++		if(xbee_dev->recv_data_offset == xbee_dev->recv_data_size)
++		{
++			xbee_dev->recv_state = RECV_STATE_WAIT_CHECKSUM;
++		}
++		break;
++	case RECV_STATE_WAIT_CHECKSUM:
++		if(0xFF - xbee_dev->recv_data_sum != c)
++		{
++			printk(KERN_WARNING "%s(): checksum failed: got 0x%02X (expected 0x%02X)\n", __func__,c,0xFF - xbee_dev->recv_data_sum);
++			printk(KERN_WARNING "%s(): Error parsing frame: discarding\n", __func__);
++			printk(KERN_WARNING "%s(): received %d bytes\n", __func__,xbee_dev->recv_data_size);
++			print_hex_dump_bytes("xbee_process_char(): ", DUMP_PREFIX_NONE, xbee_dev->recv_data, xbee_dev->recv_data_size);
++
++#ifdef __KERNEL__
++			if(xbee_dev->recv_data)
++				kfree(xbee_dev->recv_data);
++#else
++				free(xbee_dev->recv_data);
++#endif
++			xbee_dev->recv_data = NULL;
++			xbee_dev->recv_data_offset = 0;
++			xbee_dev->recv_data_escape_next = 0;
++			xbee_dev->recv_data_sum = 0;
++			xbee_dev->recv_data_size = 0;
++		}
++		else
++		{
++#ifdef	DEBUG
++		printk(KERN_INFO "%s(): Got valid frame\n", __func__);
++#endif
++			api_frame = _api_frame_parse(xbee_dev->recv_data_size,xbee_dev->recv_data,c);
++			if(api_frame)
++			{
++				xbee_dev->recv_data = NULL;
++				xbee_dev->recv_data_offset = 0;
++				xbee_dev->recv_data_escape_next = 0;
++				xbee_dev->recv_data_sum = 0;
++				xbee_dev->recv_data_size = 0;
++				if(_api_frame_process(xbee_dev,api_frame))
++				{
++					printk(KERN_WARNING "%s(): error processing frame\n", __func__);
++				}
++				api_frame = NULL;
++			}
++			else
++			{
++				printk(KERN_WARNING "%s(): Error parsing frame: discarding\n", __func__);
++#ifdef __KERNEL__
++				if(xbee_dev->recv_data)
++					kfree(xbee_dev->recv_data);
++#else
++					free(xbee_dev->recv_data);
++#endif
++				xbee_dev->recv_data = NULL;
++				xbee_dev->recv_data_offset = 0;
++				xbee_dev->recv_data_escape_next = 0;
++				xbee_dev->recv_data_sum = 0;
++				xbee_dev->recv_data_size = 0;
++			}
++		}
++
++		xbee_dev->recv_state = RECV_STATE_WAIT_START_DELIM;
++		wake_up(&xbee_dev->wq);
++
++		break;
++	default:
++		BUG(); //FIXME check if we can reach this point
++		break;
++	}
++	return 0;
++}
++
++static int
++xbee_receive(struct xbee_device *xbee_dev, const unsigned char *buf, int count)
++{
++	uint8_t rx_data = 0;
++	int i = 0;
++	if(xbee_dev == NULL)
++	{
++		printk(KERN_ERR "%s: xbee_dev NULL pointer\n", __func__);
++		BUG();
++	}
++	if(buf == NULL)
++	{
++		printk(KERN_ERR "%s: buf NULL pointer\n", __func__);
++		BUG();
++	}
++	for (i=0; i < count; ++i){
++		rx_data = buf[i];
++		if(xbee_dev->recv_state != RECV_STATE_WAIT_START_DELIM && xbee_dev->escaped_mode) {
++			if(unescape_required(rx_data))
++			{
++				xbee_dev->recv_data_escape_next = 1;
++			}
++			else if(xbee_dev->recv_data_escape_next)
++			{
++				xbee_dev->recv_data_escape_next = 0;
++				rx_data = buf[i]^0x20;
++				xbee_process_char(xbee_dev, rx_data);
++			} else {
++				xbee_process_char(xbee_dev, rx_data);
++			}
++		} else {
++			xbee_process_char(xbee_dev, rx_data);
++		}
++	}
++	return 0;
++}
++
++static int
++xbee_send(struct xbee_device *xbee_dev, _api_frame_t *api_frame)
++{
++	int ret = 0;
++#ifndef __KERNEL__
++	struct timeval tv = {0,0};
++	struct timespec waitspec = {0,0};
++	//pthread_attr_t attr;
++#endif
++
++	uint16_t len = 0;
++	uint8_t *raw_frame = NULL;
++	if(xbee_dev == NULL)
++	{
++		printk(KERN_ERR "%s: xbee_dev NULL pointer\n", __func__);
++		BUG();
++	}
++	if(api_frame == NULL)
++	{
++		printk(KERN_ERR "%s: api_frame NULL pointer\n", __func__);
++		BUG();
++	}
++
++	raw_frame = _api_frame_to_raw(api_frame,&len);
++
++	if(raw_frame  == NULL)
++	{
++		printk(KERN_ERR "%s: raw_frame NULL pointer\n", __func__);
++		BUG();
++	}
++
++	if(_api_frame_should_wait_response(api_frame))
++	{
++		xbee_device_add_pendent_req(xbee_dev,api_frame);
++	}
++
++	if((ret = xbee_device_write_to_phy(xbee_dev,raw_frame,len)) != len)
++	{
++		printk(KERN_ERR "%s: error writing to phy media: ret: %d len: %u\n", __func__,ret,len);
++		BUG(); // FIXME
++		/*
++		 * [ 1034.907503] xbee_send: error writing to phy media
++[ 1034.924140] ------------[ cut here ]------------
++[ 1034.928770] kernel BUG at drivers/net/ieee802154/xbee.c:2177!
++[ 1034.934507] Internal error: Oops - BUG: 0 [#1] PREEMPT ARM
++
++Entering kdb (current=0xda84a080, pid 6) Oops: (null)
++due to oops @ 0xbf1a4ed0
++
++Pid: 6, comm:          kworker/u:0
++CPU: 0    Not tainted  (3.9.6+ #1)
++PC is at xbee_send+0x12c/0x854 [xbee]
++LR is at xbee_send+0x12c/0x854 [xbee]
++pc : [<bf1a4ed0>]    lr : [<bf1a4ed0>]    psr: 60000113
++sp : da851e90  ip : 60000113  fp : 00000089
++r10: 0000006f  r9 : da850000  r8 : 00000000
++r7 : 0000006f  r6 : d99b49e0  r5 : d8511b40  r4 : da9c2660
++r3 : 00000000  r2 : c057f344  r1 : c0571a80  r0 : 00000025
++Flags: nZCv  IRQs on  FIQs on  Mode SVC_32  ISA ARM  Segment kernel
++Control: 00c5387d  Table: 1aac0008  DAC: 00000017
++		 *
++		 */
++	} else {
++		ret = 0;
++	}
++
++	if(raw_frame)
++	{
++#ifdef __KERNEL__
++		kfree(raw_frame);
++#else
++		free(raw_frame);
++#endif
++		raw_frame = NULL;
++	}
++
++	if(_api_frame_should_wait_response(api_frame))
++	{
++		//xbee_device_add_pendent_req(xbee_dev,api_frame);
++#ifdef __KERNEL__
++		INIT_COMPLETION(api_frame->complete);
++		ret = wait_for_completion_interruptible_timeout(
++							&api_frame->complete,
++							2 * HZ);
++		if (ret == -ERESTARTSYS){
++			xbee_device_remove_pendent_req(xbee_dev,api_frame);
++			goto err;
++		}
++		if (ret == 0) {
++			xbee_device_remove_pendent_req(xbee_dev,api_frame);
++			ret = -ETIMEDOUT;
++			goto err;
++		}
++#else
++		printk(KERN_DEBUG "%s: waiting for response...\n", __func__);
++		gettimeofday(&tv,NULL);
++		waitspec.tv_sec = tv.tv_sec + 5;
++		waitspec.tv_nsec = 0;
++		pthread_mutex_lock(&api_frame->mutex);
++		ret = pthread_cond_timedwait(&api_frame->complete,&api_frame->mutex,&waitspec);
++		if(ret != 0 && ret != ETIMEDOUT){
++			printk(KERN_ERR "%s: some error occur waiting for status to change: %d", __func__, ret);
++			pthread_mutex_unlock(&api_frame->mutex);
++			goto err;
++		}
++		pthread_mutex_unlock(&api_frame->mutex);
++		if(ret == ETIMEDOUT){
++			printk(KERN_DEBUG "%s: timeout!!!\n", __func__);
++			goto err;
++		}else{
++			printk(KERN_DEBUG "%s: response received\n", __func__);
++		}
++#endif
++		xbee_device_remove_pendent_req(xbee_dev,api_frame);
++		if(!api_frame->response)
++		{
++			printk(KERN_DEBUG "%s: response not available\n", __func__);
++			ret = -EBUSY;
++			goto err;
++		}
++		ret = _api_frame_process_response(api_frame);
++		if(ret)
++		{
++			printk(KERN_DEBUG "%s: error in response\n", __func__);
++			goto err;
++		}
++	}
++
++
++err:
++	pr_debug("%s(): ret: %d\n", __func__,ret);
++	return ret;
++}
++
++/*
++ * Frame API AT Command
++ */
++
++static _api_frame_t *
++_api_frame_new_at_command(struct xbee_device *xbee_dev,const char cmdid[3])
++{
++	_api_frame_t *api_frame = NULL;
++	api_frame = _api_frame_alloc(4,sizeof(api_frame_at_cmd_t));
++	if(api_frame == NULL)
++	{
++		printk(KERN_ERR "%s: error creating api_frame\n", __func__);
++		BUG();
++	}
++	api_frame->api_id = api_frame->api_data->at_cmd.api_id = FRAME_TYPE_AT_CMD;
++	api_frame->api_data->at_cmd.frame_id = _xbee_device_gen_frame_id(xbee_dev);
++	api_frame->api_data->at_cmd.at_command[0] = cmdid[0];
++	api_frame->api_data->at_cmd.at_command[1] = cmdid[1];
++	api_frame->api_data->at_cmd.parameter_value_len = 0;
++	return api_frame;
++}
++
++static _api_frame_t *
++_api_frame_new_at_command_u8(struct xbee_device *xbee_dev,const char cmdid[3],uint8_t arg)
++{
++	_api_frame_t *api_frame = NULL;
++	api_frame = _api_frame_alloc(5,sizeof(api_frame_at_cmd_t));
++	if(api_frame == NULL)
++	{
++		printk(KERN_ERR "%s: error creating api_frame\n", __func__);
++		BUG();
++	}
++	api_frame->api_id = api_frame->api_data->at_cmd.api_id = FRAME_TYPE_AT_CMD;
++	api_frame->api_data->at_cmd.frame_id = _xbee_device_gen_frame_id(xbee_dev);
++	api_frame->api_data->at_cmd.at_command[0] = cmdid[0];
++	api_frame->api_data->at_cmd.at_command[1] = cmdid[1];
++	api_frame->api_data->at_cmd.parameter_value[0] = arg;
++	api_frame->api_data->at_cmd.parameter_value_len = 1;
++	return api_frame;
++}
++
++static _api_frame_t *
++_api_frame_new_at_command_u16(struct xbee_device *xbee_dev,const char cmdid[3],uint8_t arg[2])
++{
++	_api_frame_t *api_frame = NULL;
++	api_frame = _api_frame_alloc(6,sizeof(api_frame_at_cmd_t));
++	if(api_frame == NULL)
++	{
++		printk(KERN_ERR "%s: error creating api_frame\n", __func__);
++		BUG();
++	}
++	api_frame->api_id = api_frame->api_data->at_cmd.api_id = FRAME_TYPE_AT_CMD;
++	api_frame->api_data->at_cmd.frame_id = _xbee_device_gen_frame_id(xbee_dev);
++	api_frame->api_data->at_cmd.at_command[0] = cmdid[0];
++	api_frame->api_data->at_cmd.at_command[1] = cmdid[1];
++	api_frame->api_data->at_cmd.parameter_value[0] = arg[0];
++	api_frame->api_data->at_cmd.parameter_value[1] = arg[1];
++	api_frame->api_data->at_cmd.parameter_value_len = 2;
++	return api_frame;
++}
++
++static _api_frame_t *
++_api_frame_new_at_command_u32(struct xbee_device *xbee_dev,const char cmdid[3],uint8_t arg[4])
++{
++	_api_frame_t *api_frame = NULL;
++	api_frame = _api_frame_alloc(8,sizeof(api_frame_at_cmd_t));
++	if(api_frame == NULL)
++	{
++		printk(KERN_ERR "%s: error creating api_frame\n", __func__);
++		BUG();
++	}
++	api_frame->api_id = api_frame->api_data->at_cmd.api_id = FRAME_TYPE_AT_CMD;
++	api_frame->api_data->at_cmd.frame_id = _xbee_device_gen_frame_id(xbee_dev);
++	api_frame->api_data->at_cmd.at_command[0] = cmdid[0];
++	api_frame->api_data->at_cmd.at_command[1] = cmdid[1];
++	api_frame->api_data->at_cmd.parameter_value[0] = arg[0];
++	api_frame->api_data->at_cmd.parameter_value[1] = arg[1];
++	api_frame->api_data->at_cmd.parameter_value[2] = arg[2];
++	api_frame->api_data->at_cmd.parameter_value[3] = arg[3];
++	api_frame->api_data->at_cmd.parameter_value_len = 4;
++	return api_frame;
++}
++
++/*
++ * Frame API AT Command - Queue Parameter Value
++ */
++
++static _api_frame_t *
++_api_frame_new_at_command_queue(struct xbee_device *xbee_dev,const char cmdid[3])
++{
++	_api_frame_t *api_frame = NULL;
++	api_frame = _api_frame_alloc(4,sizeof(api_frame_at_cmd_queue_t));
++	if(api_frame == NULL)
++	{
++		printk(KERN_ERR "%s: error creating api_frame\n", __func__);
++		BUG();
++	}
++	api_frame->api_id = api_frame->api_data->at_cmd_queue.api_id = FRAME_TYPE_AT_CMD_QUEUE;
++	api_frame->api_data->at_cmd_queue.frame_id = _xbee_device_gen_frame_id(xbee_dev);
++	api_frame->api_data->at_cmd_queue.at_command[0] = cmdid[0];
++	api_frame->api_data->at_cmd_queue.at_command[1] = cmdid[1];
++	api_frame->api_data->at_cmd_queue.parameter_value_len = 0;
++	return api_frame;
++}
++
++static _api_frame_t *
++_api_frame_new_at_command_queue_u8(struct xbee_device *xbee_dev,const char cmdid[3],uint8_t arg)
++{
++	_api_frame_t *api_frame = NULL;
++	api_frame = _api_frame_alloc(5,sizeof(api_frame_at_cmd_queue_t));
++	if(api_frame == NULL)
++	{
++		printk(KERN_ERR "%s: error creating api_frame\n", __func__);
++		BUG();
++	}
++	api_frame->api_id = api_frame->api_data->at_cmd_queue.api_id = FRAME_TYPE_AT_CMD_QUEUE;
++	api_frame->api_data->at_cmd_queue.frame_id = _xbee_device_gen_frame_id(xbee_dev);
++	api_frame->api_data->at_cmd_queue.at_command[0] = cmdid[0];
++	api_frame->api_data->at_cmd_queue.at_command[1] = cmdid[1];
++	api_frame->api_data->at_cmd_queue.parameter_value[0] = arg;
++	api_frame->api_data->at_cmd_queue.parameter_value_len = 1;
++	return api_frame;
++}
++
++static _api_frame_t *
++_api_frame_new_at_command_queue_u16(struct xbee_device *xbee_dev,const char cmdid[3],uint8_t arg[2])
++{
++	_api_frame_t *api_frame = NULL;
++	api_frame = _api_frame_alloc(6,sizeof(api_frame_at_cmd_queue_t));
++	if(api_frame == NULL)
++	{
++		printk(KERN_ERR "%s: error creating api_frame\n", __func__);
++		BUG();
++	}
++	api_frame->api_id = api_frame->api_data->at_cmd_queue.api_id = FRAME_TYPE_AT_CMD_QUEUE;
++	api_frame->api_data->at_cmd_queue.frame_id = _xbee_device_gen_frame_id(xbee_dev);
++	api_frame->api_data->at_cmd_queue.at_command[0] = cmdid[0];
++	api_frame->api_data->at_cmd_queue.at_command[1] = cmdid[1];
++	api_frame->api_data->at_cmd_queue.parameter_value[0] = arg[0];
++	api_frame->api_data->at_cmd_queue.parameter_value[1] = arg[1];
++	api_frame->api_data->at_cmd_queue.parameter_value_len = 2;
++	return api_frame;
++}
++
++static _api_frame_t *
++_api_frame_new_at_command_queue_u32(struct xbee_device *xbee_dev,const char cmdid[3],uint8_t arg[4])
++{
++	_api_frame_t *api_frame = NULL;
++	api_frame = _api_frame_alloc(8,sizeof(api_frame_at_cmd_queue_t));
++	if(api_frame == NULL)
++	{
++		printk(KERN_ERR "%s: error creating api_frame\n", __func__);
++		BUG();
++	}
++	api_frame->api_id = api_frame->api_data->at_cmd_queue.api_id = FRAME_TYPE_AT_CMD_QUEUE;
++	api_frame->api_data->at_cmd_queue.frame_id = _xbee_device_gen_frame_id(xbee_dev);
++	api_frame->api_data->at_cmd_queue.at_command[0] = cmdid[0];
++	api_frame->api_data->at_cmd_queue.at_command[1] = cmdid[1];
++	api_frame->api_data->at_cmd_queue.parameter_value[0] = arg[0];
++	api_frame->api_data->at_cmd_queue.parameter_value[1] = arg[1];
++	api_frame->api_data->at_cmd_queue.parameter_value[2] = arg[2];
++	api_frame->api_data->at_cmd_queue.parameter_value[3] = arg[3];
++	api_frame->api_data->at_cmd_queue.parameter_value_len = 4;
++	return api_frame;
++}
++
++/*
++ * Frame API Transmit Request
++ */
++
++static _api_frame_t *
++_api_frame_new_transmit_request(struct xbee_device *xbee_dev,
++		uint8_t dst_addr[XBEE_ADDR_LEN], uint8_t options, uint8_t *payload,
++		uint16_t payload_len) {
++	_api_frame_t *api_frame = NULL;
++	size_t frame_len = 1 /* frame type */ +
++			1 /* frameID*/ +
++			XBEE_ADDR_LEN +
++			2 /* reserved */ +
++			1 /* broadcast radius */ +
++			1 /* transmit options */ +
++			payload_len;
++	api_frame = _api_frame_alloc(frame_len,sizeof(api_frame_transmit_req_t));
++	if (api_frame == NULL ) {
++		printk(KERN_ERR "%s: error creating api_frame\n", __func__);
++		BUG();
++	}
++	api_frame->api_id = api_frame->api_data->transmit_req.api_id = FRAME_TYPE_TRANSMIT_REQ;
++	api_frame->api_data->transmit_req.frame_id = _xbee_device_gen_frame_id(xbee_dev);
++	memcpy(api_frame->api_data->transmit_req.dst_addr, dst_addr, XBEE_ADDR_LEN);
++	api_frame->api_data->transmit_req.reserved = 0xFFFE;
++	api_frame->api_data->transmit_req.brd_radius = XBEE_DEFAULT_BROADCAST_RADIUS;
++	api_frame->api_data->transmit_req.options = options;
++	api_frame->api_data->transmit_req.payload = payload;
++	api_frame->api_data->transmit_req.payload_len = payload_len;
++	return api_frame;
++}
++
++/*
++ * Frame API IEEE 802.15.4 Raw Packet
++ */
++
++static _api_frame_t *
++_api_frame_new_raw_packet(struct xbee_device *xbee_dev, uint8_t *payload, uint16_t payload_len) {
++	_api_frame_t *api_frame = NULL;
++	size_t frame_len = 1 /* frame type */ +
++			payload_len;
++	api_frame = _api_frame_alloc(frame_len,sizeof(api_frame_transmit_req_t));
++	if (api_frame == NULL ) {
++		printk(KERN_ERR "%s: error creating api_frame\n", __func__);
++		BUG();
++	}
++	api_frame->api_id = api_frame->api_data->raw_packet.api_id = FRAME_TYPE_RAW_TRANSMIT_REQ;
++	api_frame->api_data->raw_packet.frame_id = _xbee_device_gen_frame_id(xbee_dev);
++	api_frame->api_data->raw_packet.payload = payload;
++	api_frame->api_data->raw_packet.payload_len = payload_len;
++	return api_frame;
++}
++
++/*
++ * Frame API Explicit Addressing Command
++ */
++
++//static _api_frame_t *
++//_api_frame_new_explicit_addressing(struct xbee_device *xbee_dev,
++//		uint8_t dst_addr[XBEE_ADDR_LEN], uint8_t options, uint8_t *payload,
++//		uint16_t payload_len) {
++//	//TODO: _api_frame_new_explicit_addressing: not implemented
++//	return NULL;
++//}
++
++/*
++ * Frame API Remote AT Command Request
++ */
++
++//static _api_frame_t *
++//_api_frame_new_remote_at_command(struct xbee_device *xbee_dev,
++//		uint8_t dst_addr[XBEE_ADDR_LEN], const char cmdid[3]) {
++//	//TODO: _api_frame_new_remote_at_command_u32: not implemented
++//	return NULL ;
++//}
++//
++//static _api_frame_t *
++//_api_frame_new_remote_at_command_u8(struct xbee_device *xbee_dev,
++//		uint8_t dst_addr[XBEE_ADDR_LEN], const char cmdid[3], uint8_t arg[1]) {
++//	//TODO: _api_frame_new_remote_at_command_u8: not implemented
++//	return NULL ;
++//}
++//
++//static _api_frame_t *
++//_api_frame_new_remote_at_command_u16(struct xbee_device *xbee_dev,
++//		uint8_t dst_addr[XBEE_ADDR_LEN], const char cmdid[3], uint8_t arg[2]) {
++//	//TODO: _api_frame_new_remote_at_command_u16: not implemented
++//	return NULL ;
++//}
++//
++//static _api_frame_t *
++//_api_frame_new_remote_at_command_u32(struct xbee_device *xbee_dev,
++//		uint8_t dst_addr[XBEE_ADDR_LEN], const char cmdid[3], uint8_t arg[4]) {
++//	//TODO: _api_frame_new_remote_at_command_u32: not implemented
++//	return NULL ;
++//}
++
++/*
++ * XBee AT Command Read 32 bit parameter
++ */
++
++static int
++xbee_api_at_command_read_uN(struct xbee_device *xbee_dev, const char cmdid[3], uint8_t value[4], uint8_t len)
++{
++	int ret = 0;
++	int i = 0;
++	_api_frame_t *api_frame = NULL;
++
++	if (NULL == xbee_dev) {
++		printk(KERN_ERR "%s: wrong xbee device\n", __func__);
++		return -EINVAL;
++	}
++
++	api_frame = _api_frame_new_at_command(xbee_dev,cmdid);
++
++	ret = xbee_send(xbee_dev,api_frame);
++
++	if(ret)
++	{
++		printk(KERN_ERR "%s: error sending API frame: %s: %d\n", __func__,cmdid,ret);
++		goto err;
++	}
++
++	if(!api_frame->response)
++	{
++		printk(KERN_ERR "%s: response is NULL\n", __func__);
++		ret = -EAGAIN;
++		goto err;
++	}
++
++	if(api_frame->response->api_data->at_cmd_resp.cmd_data_len != len)
++	{
++		printk(KERN_ERR "%s: invalid response value len\n", __func__);
++		ret = -EAGAIN;
++		goto err;
++	}
++
++	_api_frame_print(api_frame);
++	if(api_frame && api_frame->response)
++		_api_frame_print(api_frame->response);
++
++	for(i=0;i<api_frame->response->api_data->at_cmd_resp.cmd_data_len;i++)
++	{
++		value[i] = api_frame->response->api_data->at_cmd_resp.cmd_data[i];
++	}
++
++	pr_debug("%s(): xbee_send ret: %d\n", __func__,ret);
++
++err:
++	if(api_frame)
++	{
++		_api_frame_free(api_frame);
++	}
++
++	return 0;
++}
++
++static int
++xbee_api_at_command_read_u8(struct xbee_device *xbee_dev, const char cmdid[3], uint8_t value[1])
++{
++	return xbee_api_at_command_read_uN(xbee_dev,cmdid,value,1);
++}
++
++static int
++xbee_api_at_command_read_u16(struct xbee_device *xbee_dev, const char cmdid[3], uint8_t value[2])
++{
++	return xbee_api_at_command_read_uN(xbee_dev,cmdid,value,2);
++}
++
++static int
++xbee_api_at_command_read_u32(struct xbee_device *xbee_dev, const char cmdid[3], uint8_t value[4])
++{
++	return xbee_api_at_command_read_uN(xbee_dev,cmdid,value,4);
++}
++
++#ifndef __KERNEL__
++static void
++dump_hex(uint8_t *buf, int len);
++#endif
++
++//static int
++//xbee_ieee_address(struct xbee_device *xbee_dev, uint8_t addr[IEEE802154_ADDR_LEN])
++////xbee_ieee_address(struct ieee802154_dev *dev, uint8_t addr[IEEE802154_ADDR_LEN])
++//{
++//	//struct xbee_device *xbee_dev = NULL;
++//
++////	uint8_t serial_number_high[4] = {};
++////	uint8_t serial_number_low[4] = {};
++//
++//	int ret = 0;
++//	pr_debug("%s\n", __func__);
++//
++//	//xbee_dev = dev->priv;
++//	if (NULL == xbee_dev) {
++//		printk(KERN_ERR "%s: wrong phy\n", __func__);
++//		return -EINVAL;
++//	}
++//
++//	//ret = xbee_api_at_command_read_u32(xbee_dev,"SH",serial_number_high);
++//	ret = xbee_api_at_command_read_u32(xbee_dev,"SH",addr);
++//	if(ret)
++//	{
++//		printk(KERN_ERR "%s: error getting serial high value\n", __func__);
++//		return ret;
++//	}
++//	//dump_hex(serial_number_high, 4); printf("\n");
++//
++//	//ret = xbee_api_at_command_read_u32(xbee_dev,"SL",serial_number_low);
++//	ret = xbee_api_at_command_read_u32(xbee_dev,"SL",addr+4);
++//	if(ret)
++//	{
++//		printk(KERN_ERR "%s: error getting serial low value\n", __func__);
++//		return ret;
++//	}
++//	//dump_hex(serial_number_low, 4); printf("\n");
++//
++//#ifndef __KERNEL__
++//	dump_hex(addr, 8); printf("\n");
++//#endif
++//	pr_debug("%s end\n", __func__);
++//	return ret;
++//}
++
++static uint8_t
++xbee_get_rssi(struct ieee802154_dev *dev)
++{
++	struct xbee_device *xbee_dev = NULL;
++	uint8_t result = 0x00;
++	int ret = 0;
++	pr_debug("%s\n", __func__);
++
++	xbee_dev = dev->priv;
++	if (NULL == xbee_dev) {
++		printk(KERN_ERR "%s: wrong phy\n", __func__);
++		return -EINVAL;
++	}
++
++	ret = xbee_api_at_command_read_u8(xbee_dev,"DB",&result);
++	if(ret)
++	{
++		printk(KERN_ERR "%s: error getting RSSI value\n", __func__);
++		return ret;
++	}
++
++	global_lqi = result;
++
++#ifndef __KERNEL__
++	dump_hex(addr, 8); printf("\n");
++#endif
++	pr_debug("%s end\n", __func__);
++	return result;
++}
++
++//static uint16_t
++//xbee_get_pan_id(struct ieee802154_dev *dev)
++//{
++//	struct xbee_device *xbee_dev = NULL;
++//	uint8_t at_cmd_result[4] = {0,0,0,0};
++//	uint16_t result = 0x0000;
++//	int ret = 0;
++//	pr_debug("%s\n", __func__);
++//
++//	xbee_dev = dev->priv;
++//	if (NULL == xbee_dev) {
++//		printk(KERN_ERR "%s: wrong phy\n", __func__);
++//		return -EINVAL;
++//	}
++//
++//	ret = xbee_api_at_command_read_u16(xbee_dev,"ID",&at_cmd_result);
++//	if(ret)
++//	{
++//		printk(KERN_ERR "%s: error getting network id value\n", __func__);
++//		return ret;
++//	}
++//#ifndef __KERNEL__
++//	dump_hex(addr, 8); printf("\n");
++//#endif
++//	result = ((at_cmd_result[0] << 8) & 0xFF00) + (at_cmd_result[1] & 0xFF);
++//
++//	pr_debug("%s end\n", __func__);
++//	return result;
++//}
++
++static uint8_t
++xbee_get_dsn(struct ieee802154_dev *dev)
++{
++	struct xbee_device *xbee_dev = NULL;
++	uint8_t dsn = 0x00;
++	pr_debug("%s\n", __func__);
++
++	xbee_dev = dev->priv;
++	if (NULL == xbee_dev) {
++		printk(KERN_ERR "%s: wrong phy\n", __func__);
++		return -EINVAL;
++	}
++
++#ifdef __KERNEL__
++	mutex_lock(&xbee_dev->mutex);
++#else
++	pthread_mutex_lock(&xbee_dev->mutex);
++#endif
++	dsn = xbee_dev->frame_id_counter;
++#ifdef __KERNEL__
++	mutex_unlock(&xbee_dev->mutex);
++#else
++	pthread_mutex_unlock(&xbee_dev->mutex);
++#endif
++
++	pr_debug("%s end\n", __func__);
++	return dsn;
++}
++
++#ifdef __KERNEL__
++
++/*
++ * MAC802154 parsing functions
++ */
++
++static inline int mac802154_fetch_skb_u8(struct sk_buff *skb, u8 *val)
++{
++	if (unlikely(!pskb_may_pull(skb, 1)))
++		return -EINVAL;
++
++	*val = skb->data[0];
++	skb_pull(skb, 1);
++
++	return 0;
++}
++
++static inline int mac802154_fetch_skb_u16(struct sk_buff *skb, u16 *val)
++{
++	if (unlikely(!pskb_may_pull(skb, 2)))
++		return -EINVAL;
++
++	*val = skb->data[0] | (skb->data[1] << 8);
++	skb_pull(skb, 2);
++
++	return 0;
++}
++
++static inline void mac802154_haddr_copy_swap(u8 *dest, const u8 *src)
++{
++	int i;
++	for (i = 0; i < IEEE802154_ADDR_LEN; i++)
++		dest[IEEE802154_ADDR_LEN - i - 1] = src[i];
++}
++
++static int mac802154_parse_frame_start(struct sk_buff *skb)
++{
++	u8 *head = skb->data;
++	u16 fc;
++
++	if (mac802154_fetch_skb_u16(skb, &fc) ||
++	    mac802154_fetch_skb_u8(skb, &(mac_cb(skb)->seq)))
++		goto err;
++
++	pr_debug("fc: %04x dsn: %02x\n", fc, head[2]);
++
++	mac_cb(skb)->flags = IEEE802154_FC_TYPE(fc);
++	mac_cb(skb)->sa.addr_type = IEEE802154_FC_SAMODE(fc);
++	mac_cb(skb)->da.addr_type = IEEE802154_FC_DAMODE(fc);
++
++	if (fc & IEEE802154_FC_INTRA_PAN)
++		mac_cb(skb)->flags |= MAC_CB_FLAG_INTRAPAN;
++
++	if (mac_cb(skb)->da.addr_type != IEEE802154_ADDR_NONE) {
++		if (mac802154_fetch_skb_u16(skb, &(mac_cb(skb)->da.pan_id)))
++			goto err;
++
++		/* source PAN id compression */
++		if (mac_cb_is_intrapan(skb))
++			mac_cb(skb)->sa.pan_id = mac_cb(skb)->da.pan_id;
++
++		pr_debug("dest PAN addr: %04x\n", mac_cb(skb)->da.pan_id);
++
++		if (mac_cb(skb)->da.addr_type == IEEE802154_ADDR_SHORT) {
++			u16 *da = &(mac_cb(skb)->da.short_addr);
++
++			if (mac802154_fetch_skb_u16(skb, da))
++				goto err;
++
++			pr_debug("destination address is short: %04x\n",
++				 mac_cb(skb)->da.short_addr);
++		} else {
++			if (!pskb_may_pull(skb, IEEE802154_ADDR_LEN))
++				goto err;
++
++			mac802154_haddr_copy_swap(mac_cb(skb)->da.hwaddr,
++						  skb->data);
++			skb_pull(skb, IEEE802154_ADDR_LEN);
++
++			pr_debug("destination address is hardware\n");
++		}
++	}
++
++	if (mac_cb(skb)->sa.addr_type != IEEE802154_ADDR_NONE) {
++		/* non PAN-compression, fetch source address id */
++		if (!(mac_cb_is_intrapan(skb))) {
++			u16 *sa_pan = &(mac_cb(skb)->sa.pan_id);
++
++			if (mac802154_fetch_skb_u16(skb, sa_pan))
++				goto err;
++		}
++
++		pr_debug("source PAN addr: %04x\n", mac_cb(skb)->da.pan_id);
++
++		if (mac_cb(skb)->sa.addr_type == IEEE802154_ADDR_SHORT) {
++			u16 *sa = &(mac_cb(skb)->sa.short_addr);
++
++			if (mac802154_fetch_skb_u16(skb, sa))
++				goto err;
++
++			pr_debug("source address is short: %04x\n",
++				 mac_cb(skb)->sa.short_addr);
++		} else {
++			if (!pskb_may_pull(skb, IEEE802154_ADDR_LEN))
++				goto err;
++
++			mac802154_haddr_copy_swap(mac_cb(skb)->sa.hwaddr,
++						  skb->data);
++			skb_pull(skb, IEEE802154_ADDR_LEN);
++
++			pr_debug("source address is hardware\n");
++		}
++	}
++
++	return 0;
++err:
++	return -EINVAL;
++}
++
++/*
++ * to bind XBEE RX API frame to a ieee802154_addr
++ * addr_type = IEEE802154_ADDR_LONG (EUI-64 + PanId)
++ * pan_id = network ID (cmd ATID result should be used)
++ * hwaddr = RX EUI-64bit addr from API
++struct ieee802154_addr {
++	int addr_type;
++	u16 pan_id;
++	union {
++		u8 hwaddr[IEEE802154_ADDR_LEN];
++		u16 short_addr;
++	};
++};
++ *
++ */
++
++static int mac802154_header_create(struct sk_buff *skb,
++					struct ieee802154_dev *dev,
++				   unsigned short type,
++				   const void *_daddr,
++				   const void *_saddr,
++				   unsigned len)
++{
++	const struct ieee802154_addr *saddr = _saddr;
++	const struct ieee802154_addr *daddr = _daddr;
++	struct ieee802154_addr dev_addr;
++	struct xbee_device *xbee_dev = dev->priv;
++	int pos = 2;
++	u8 head[MAC802154_FRAME_HARD_HEADER_LEN];
++	u16 fc;
++
++	if (!daddr)
++		return -EINVAL;
++
++	//head[pos++] = mac_cb(skb)->seq; /* DSN/BSN */ /* we should use FrameID here!!!! */
++	//head[pos++] = xbee_get_dsn(dev);
++	head[pos++] = 0;
++	fc = mac_cb_type(skb);
++
++	if (!saddr) {
++		//spin_lock_bh(&zbdev->mib_lock);
++
++//		if (zbdev->short_addr == IEEE802154_ADDR_BROADCAST ||
++//			zbdev->short_addr == IEEE802154_ADDR_UNDEF ||
++//			zbdev->pan_id == IEEE802154_PANID_BROADCAST) {
++			dev_addr.addr_type = IEEE802154_ADDR_LONG;
++//
++			// replace here with EUI64 of the hw
++			memcpy(dev_addr.hwaddr, xbee_dev->dev_addr, IEEE802154_ADDR_LEN);
++//		} else {
++//			dev_addr.addr_type = IEEE802154_ADDR_SHORT;
++//			dev_addr.short_addr = zbdev->short_addr;
++//		}
++
++		dev_addr.pan_id = xbee_dev->pan_id; // network addr ATID?
++		saddr = &dev_addr;
++
++		//spin_unlock_bh(&zbdev->mib_lock);
++	}
++
++	if (daddr->addr_type != IEEE802154_ADDR_NONE) {
++		fc |= (daddr->addr_type << IEEE802154_FC_DAMODE_SHIFT);
++
++		head[pos++] = daddr->pan_id & 0xff;
++		head[pos++] = daddr->pan_id >> 8;
++
++		if (daddr->addr_type == IEEE802154_ADDR_SHORT) {
++			head[pos++] = daddr->short_addr & 0xff;
++			head[pos++] = daddr->short_addr >> 8;
++		} else {
++			mac802154_haddr_copy_swap(head + pos, daddr->hwaddr);
++			pos += IEEE802154_ADDR_LEN;
++		}
++	}
++
++	if (saddr->addr_type != IEEE802154_ADDR_NONE) {
++		fc |= (saddr->addr_type << IEEE802154_FC_SAMODE_SHIFT);
++
++		if ((saddr->pan_id == daddr->pan_id) &&
++		    (saddr->pan_id != IEEE802154_PANID_BROADCAST)) {
++			/* PANID compression/intra PAN */
++			fc |= IEEE802154_FC_INTRA_PAN;
++		} else {
++			head[pos++] = saddr->pan_id & 0xff;
++			head[pos++] = saddr->pan_id >> 8;
++		}
++
++		if (saddr->addr_type == IEEE802154_ADDR_SHORT) {
++			head[pos++] = saddr->short_addr & 0xff;
++			head[pos++] = saddr->short_addr >> 8;
++		} else {
++			mac802154_haddr_copy_swap(head + pos, saddr->hwaddr);
++			pos += IEEE802154_ADDR_LEN;
++		}
++	}
++
++	head[0] = fc;
++	head[1] = fc >> 8;
++
++	memcpy(skb_push(skb, pos), head, pos);
++
++	return pos;
++}
++
++//#define DEBUG 1
++static int enable_debug = 0;
++
++static int
++ieee802154_hm_trp_xmit(struct ieee802154_dev *dev, struct sk_buff *skb){
++	struct xbee_device *xbee_dev = NULL;
++	_api_frame_t *api_frame = NULL;
++
++	struct sk_buff *sskb = NULL;
++	int ret = 0;
++
++	xbee_dev = dev->priv;
++	if (NULL == xbee_dev) {
++		printk(KERN_ERR "%s: wrong phy\n", __func__);
++		return -EINVAL;
++	}
++	pr_debug("%s(): recv_state: %d\n", __func__, xbee_dev->recv_state);
++
++	pr_debug("%s(): BEFORE wait\n", __func__);
++	if (wait_event_interruptible_timeout(xbee_dev->wq,
++				xbee_dev->recv_state == RECV_STATE_WAIT_START_DELIM,
++				msecs_to_jiffies(1000)) > 0) {
++		pr_debug("%s(): AFTER wait\n", __func__);
++	} else {
++		ret = -ETIMEDOUT;
++		pr_debug("%s(): TIMEOUT\n", __func__);
++		goto out;
++	}
++
++	sskb = skb_clone(skb, GFP_ATOMIC);
++	if (sskb) {
++		api_frame = _api_frame_new_raw_packet(xbee_dev,sskb->data,sskb->len);
++
++		if(api_frame){
++			_api_frame_print(api_frame);
++
++			ret = xbee_send(xbee_dev,api_frame);
++			if(ret){
++				ret = -EAGAIN;
++				if(enable_debug){
++					print_hex_dump_bytes("ieee802154_serial_xmit(): before parse: ", DUMP_PREFIX_NONE,sskb->data, sskb->len);
++				}
++			}
++			pr_debug("%s: xbee_send ret: %d\n", __func__,ret);
++			_api_frame_free(api_frame);
++		} else {
++			ret = -ENOMEM;
++			printk(KERN_DEBUG "%s: xbee_send ret: %d\n", __func__,ret);
++		}
++		kfree_skb(sskb);
++	}
++out:
++	pr_debug("%s end\n", __func__);
++	return ret;
++}
++
++static int
++ieee802154_xbee_xmit(struct ieee802154_dev *dev, struct sk_buff *skb){
++	u8 broadcast_check = 0x00;
++	u8 xbee_broadcast_addr[XBEE_ADDR_LEN] = {0x00,0x00,0x00,0x00,0x00,0x00,0xFF,0xFF};
++	struct xbee_device *xbee_dev = NULL;
++	_api_frame_t *api_frame = NULL;
++
++	struct sk_buff *sskb = NULL;
++	int ret = 0;
++
++	xbee_dev = dev->priv;
++	if (NULL == xbee_dev) {
++		printk(KERN_ERR "%s: wrong phy\n", __func__);
++		return -EINVAL;
++	}
++	pr_debug("%s(): recv_state: %d\n", __func__, xbee_dev->recv_state);
++
++	pr_debug("%s(): BEFORE wait\n", __func__);
++	if (wait_event_interruptible_timeout(xbee_dev->wq,
++				xbee_dev->recv_state == RECV_STATE_WAIT_START_DELIM,
++				msecs_to_jiffies(1000)) > 0) {
++		pr_debug("%s(): AFTER wait\n", __func__);
++	} else {
++		ret = -ETIMEDOUT;
++		pr_debug("%s(): TIMEOUT\n", __func__);
++		goto out;
++	}
++
++	sskb = skb_clone(skb, GFP_ATOMIC);
++	if (sskb) {
++
++#ifdef DEBUG
++		print_hex_dump_bytes("ieee802154_serial_xmit(): before parse: ", DUMP_PREFIX_NONE,
++				skb->data, skb->len);
++#endif
++		mac802154_parse_frame_start(sskb);
++		pr_debug("%s(): type: %d\n", __func__, sskb->pkt_type);
++		pr_debug("%s(): mac_len: %d\n", __func__, sskb->mac_len);
++		pr_debug("%s(): len: %d\n", __func__, sskb->len);
++#ifdef DEBUG
++		print_hex_dump_bytes("ieee802154_serial_xmit(): mac_header: ", DUMP_PREFIX_NONE,
++				sskb->mac_header, sskb->mac_len);
++#endif
++
++		pr_debug("%s(): sa.addr_type: %d\n", __func__, mac_cb(sskb)->sa.addr_type);
++#ifdef DEBUG
++		print_hex_dump_bytes("ieee802154_serial_xmit(): sa.hwaddr: ", DUMP_PREFIX_NONE,
++				mac_cb(sskb)->sa.hwaddr, 8);
++#endif
++		pr_debug("%s(): da.addr_type: %d\n", __func__, mac_cb(sskb)->da.addr_type);
++#ifdef DEBUG
++		print_hex_dump_bytes("ieee802154_serial_xmit(): da.hwaddr: ", DUMP_PREFIX_NONE,
++				mac_cb(sskb)->da.hwaddr, 8);
++#endif
++#ifdef DEBUG
++		print_hex_dump_bytes("ieee802154_serial_xmit(): data: ", DUMP_PREFIX_NONE,
++				sskb->data, sskb->len);
++#endif
++
++		/*
++		 * check if da.hwaddr is broadcast (0xFFFFFFFFFFFFFFFF) and
++		 * ERRATA: check if da.hwaddr is broadcast (0xFFFF0000000000) and
++		 * replace with 0x000000000000FFFF
++		 */
++		if(mac_cb(sskb)->da.hwaddr[0] == 0xFF &&
++				mac_cb(sskb)->da.hwaddr[1] == 0xFF &&
++				mac_cb(sskb)->da.hwaddr[2] == 0x00 &&
++				mac_cb(sskb)->da.hwaddr[3] == 0x00 &&
++				mac_cb(sskb)->da.hwaddr[4] == 0x00 &&
++				mac_cb(sskb)->da.hwaddr[5] == 0x00 &&
++				mac_cb(sskb)->da.hwaddr[6] == 0x00 &&
++				mac_cb(sskb)->da.hwaddr[7] == 0x00
++				){
++			broadcast_check = 0xFF;
++		}
++		if(broadcast_check == 0xFF){
++			api_frame = _api_frame_new_transmit_request(xbee_dev,xbee_broadcast_addr,0x00,skb->data,skb->len);
++			//api_frame = _api_frame_new_transmit_request_splited(xbee_dev,xbee_broadcast_addr,0x00,sskb->data,sskb->len);
++		} else {
++			api_frame = _api_frame_new_transmit_request(xbee_dev,xbee_broadcast_addr,0x00,skb->data,skb->len);
++			//api_frame = _api_frame_new_transmit_request_splited(xbee_dev,mac_cb(sskb)->da.hwaddr,0x00,sskb->data,sskb->len);
++		}
++
++		if(api_frame){
++			_api_frame_print(api_frame);
++
++			ret = xbee_send(xbee_dev,api_frame);
++			if(ret){
++				ret = -EAGAIN;
++				if(enable_debug){
++					print_hex_dump_bytes("ieee802154_serial_xmit(): before parse: ", DUMP_PREFIX_NONE,skb->data, skb->len);
++					pr_debug("%s(): type: %d\n", __func__, sskb->pkt_type);
++					pr_debug("%s(): mac_len: %d\n", __func__, sskb->mac_len);
++					pr_debug("%s(): len: %d\n", __func__, sskb->len);
++					print_hex_dump_bytes("ieee802154_serial_xmit(): mac_header: ", DUMP_PREFIX_NONE,
++							sskb->mac_header, sskb->mac_len);
++					printk(KERN_DEBUG "%s(): sa.addr_type: %d\n", __func__, mac_cb(sskb)->sa.addr_type);
++					print_hex_dump_bytes("ieee802154_serial_xmit(): sa.hwaddr: ", DUMP_PREFIX_NONE,
++							mac_cb(sskb)->sa.hwaddr, 8);
++					printk(KERN_DEBUG "%s(): da.addr_type: %d\n", __func__, mac_cb(sskb)->da.addr_type);
++					print_hex_dump_bytes("ieee802154_serial_xmit(): da.hwaddr: ", DUMP_PREFIX_NONE,
++							mac_cb(sskb)->da.hwaddr, 8);
++					print_hex_dump_bytes("ieee802154_serial_xmit(): data: ", DUMP_PREFIX_NONE,
++							sskb->data, sskb->len);
++				}
++
++			}
++			pr_debug("%s: xbee_send ret: %d\n", __func__,ret);
++			_api_frame_free(api_frame);
++		} else {
++			ret = -ENOMEM;
++			printk(KERN_DEBUG "%s: xbee_send ret: %d\n", __func__,ret);
++		}
++		kfree_skb(sskb);
++	}
++out:
++	pr_debug("%s end\n", __func__);
++	return ret;
++}
++
++static int
++ieee802154_xmit(struct ieee802154_dev *dev, struct sk_buff *skb){
++	struct xbee_device *xbee_dev = NULL;
++	int ret = 0;
++	int mote_type = UNKNOWN_MOTE;
++	xbee_dev = dev->priv;
++	if (NULL == xbee_dev) {
++		printk(KERN_ERR "%s: wrong phy\n", __func__);
++		return -EINVAL;
++	}
++
++	mote_type = xbee_device_get_type(xbee_dev);
++
++	switch(mote_type){
++	case XBEE_XB08_DP_MOTE:
++		ret = ieee802154_xbee_xmit(dev,skb);
++		break;
++	case HM_TRP_433D_MOTE:
++	case HM_TRP_868D_MOTE:
++		ret = ieee802154_hm_trp_xmit(dev,skb);
++		break;
++	default:
++		ret = -ENOTSUPP;
++		break;
++	}
++
++	return ret;
++}
++
++static int
++ieee802154_xbee_ed(struct ieee802154_dev *dev, u8 *level){
++	int ret = 0;
++	int mote_type = UNKNOWN_MOTE;
++	struct xbee_device *xbee_dev = NULL;
++	pr_debug("%s\n", __func__);
++
++	xbee_dev = dev->priv;
++	if (NULL == xbee_dev) {
++		printk(KERN_ERR "%s: wrong phy\n", __func__);
++		return -EINVAL;
++	}
++
++	mote_type = xbee_device_get_type(xbee_dev);
++	printk(KERN_DEBUG "%s: mote type: %d\n", __func__,mote_type);
++
++	pr_debug("%s end\n", __func__);
++	return ret;
++}
++
++static int
++ieee802154_xbee_set_channel(struct ieee802154_dev *dev, int page, int channel){
++	int ret = 0;
++	struct xbee_device *xbee_dev = NULL;
++	int mote_type = UNKNOWN_MOTE;
++	pr_debug("%s\n", __func__);
++
++	xbee_dev = dev->priv;
++	if (NULL == xbee_dev) {
++		printk(KERN_ERR "%s: wrong phy\n", __func__);
++		return -EINVAL;
++	}
++
++	mote_type = xbee_device_get_type(xbee_dev);
++	printk(KERN_DEBUG "%s: mote type: %d\n", __func__,mote_type);
++
++	pr_debug("%s end\n", __func__);
++	return ret;
++}
++
++static int
++ieee802154_xbee_start(struct ieee802154_dev *dev){
++	int ret = 0;
++	struct xbee_device *xbee_dev = NULL;
++	int mote_type = UNKNOWN_MOTE;
++	pr_debug("%s\n", __func__);
++	xbee_dev = dev->priv;
++	if (NULL == xbee_dev) {
++		printk(KERN_ERR "%s: wrong phy\n", __func__);
++		return -EINVAL;
++	}
++
++	mote_type = xbee_device_get_type(xbee_dev);
++	printk(KERN_DEBUG "%s: mote type: %d\n", __func__,mote_type);
++
++	pr_debug("%s end\n", __func__);
++	return ret;
++}
++
++static void
++ieee802154_xbee_stop(struct ieee802154_dev *dev){
++	//struct xbee_device *xbee_dev = NULL;
++	pr_debug("%s\n", __func__);
++	pr_debug("%s end\n", __func__);
++	return;
++}
++
++static int
++ieee802154_xbee_address(struct ieee802154_dev *dev, u8 addr[IEEE802154_ADDR_LEN]){
++	int ret = 0;
++	struct xbee_device *xbee_dev = NULL;
++	int mote_type = UNKNOWN_MOTE;
++	u8 addr_tmp[IEEE802154_ADDR_LEN] = {};
++	u8 network_id[2] = {};
++
++	pr_debug("%s\n", __func__);
++
++	xbee_dev = dev->priv;
++	if (NULL == xbee_dev) {
++		printk(KERN_ERR "%s: wrong phy\n", __func__);
++		return -EINVAL;
++	}
++
++	mote_type = xbee_device_get_type(xbee_dev);
++	printk(KERN_DEBUG "%s: mote type: %d\n", __func__,mote_type);
++
++	ret = xbee_api_at_command_read_u32(xbee_dev,"SH",addr_tmp);
++	if(ret)
++	{
++		printk(KERN_ERR "%s: error getting serial high value\n", __func__);
++		return ret;
++	}
++	ret = xbee_api_at_command_read_u32(xbee_dev,"SL",addr_tmp+4);
++	if(ret)
++	{
++		printk(KERN_ERR "%s: error getting serial low value\n", __func__);
++		return ret;
++	}
++	memcpy(addr,addr_tmp,IEEE802154_ADDR_LEN);
++	memcpy(xbee_dev->dev_addr,addr_tmp,IEEE802154_ADDR_LEN);
++
++	ret = xbee_api_at_command_read_u16(xbee_dev,"ID",network_id);
++	if(ret)
++	{
++		printk(KERN_ERR "%s: error getting serial low value\n", __func__);
++		return ret;
++	}
++	xbee_dev->pan_id = ((network_id[0] << 8) & 0xFF00) + (network_id[1] & 0xFF);
++
++	pr_debug("%s end\n", __func__);
++	return ret;
++}
++
++/*
++ * to bind XBEE RX API frame to a ieee802154_addr
++ * addr_type = IEEE802154_ADDR_LONG (EUI-64 + PanId)
++ * pan_id = network ID (cmd ATID result should be used)
++ * hwaddr = RX EUI-64bit addr from API
++struct ieee802154_addr {
++	int addr_type;
++	u16 pan_id;
++	union {
++		u8 hwaddr[IEEE802154_ADDR_LEN];
++		u16 short_addr;
++	};
++};
++ *
++ */
++
++struct xbee_rx_work {
++	struct sk_buff *skb;
++	struct work_struct work;
++	struct xbee_device *xbee_dev;
++	uint8_t lqi;
++	bool update_lqi;
++	u8 src_addr[IEEE802154_ADDR_LEN];
++};
++
++static void xbee_rx_worker(struct work_struct *work)
++{
++	u8 lqi = 0x00;
++	struct xbee_rx_work *rw = container_of(work, struct xbee_rx_work, work);
++	struct sk_buff *skb = rw->skb;
++
++	if(rw->xbee_dev->device_driver == HM_TRP_433D_MOTE || rw->xbee_dev->device_driver == HM_TRP_868D_MOTE){
++		lqi = rw->lqi;
++	}else if(rw->xbee_dev->device_driver == XBEE_XB08_DP_MOTE){
++		lqi = xbee_get_rssi(rw->xbee_dev->dev);
++		pr_debug("%s(): lqi: %d (0x%02X)\n", __func__,lqi,lqi);
++	}
++	ieee802154_rx_irqsafe(rw->xbee_dev->dev, skb, lqi);
++	if(rw->update_lqi)
++		xbee_stat_update_lqi(rw->src_addr,lqi);
++	kfree(rw);
++}
++
++//static void
++//xbee_net_rx_old(struct xbee_device *xbee_dev, _api_frame_t *api_frame){
++//	/* zbdev->param1 is LQI
++//	 * zbdev->param2 is length of data
++//	 * zbdev->data is data itself
++//	 */
++//	struct sk_buff *skb = NULL;
++//	unsigned char *data = NULL;
++////	struct ieee802154_addr saddr = {};
++////	struct ieee802154_addr daddr = {};
++//
++//	struct xbee_rx_work *work;
++//
++//	skb = alloc_skb(api_frame->api_data->receive_packet.payload_len, GFP_ATOMIC);
++////	skb_reserve(skb,MAC802154_FRAME_HARD_HEADER_LEN);
++//
++//	data = skb_put(skb, api_frame->api_data->receive_packet.payload_len);
++//	//skb_copy_to_linear_data(skb, api_frame->api_data->receive_packet.payload, api_frame->api_data->receive_packet.payload_len);
++//	//memcpy(skb->data, from, len);
++//	memcpy(data, api_frame->api_data->receive_packet.payload, api_frame->api_data->receive_packet.payload_len);
++//
++////	saddr.addr_type = IEEE802154_ADDR_LONG;
++////	//saddr.pan_id = xbee_dev->pan_id;
++////	saddr.pan_id = 0x00FF;
++////	memcpy(saddr.hwaddr,api_frame->api_data->receive_packet.src_addr,IEEE802154_ADDR_LEN);
++////
++////	daddr.addr_type = IEEE802154_ADDR_LONG;
++////	//daddr.pan_id = xbee_dev->pan_id;
++////	daddr.pan_id = 0x00FF;
++////	memcpy(daddr.hwaddr,xbee_dev->dev_addr,IEEE802154_ADDR_LEN);
++////
++////	mac_cb(skb)->flags = IEEE802154_FC_TYPE_DATA;
++////	mac802154_header_create(skb,xbee_dev->dev,0,&daddr,&saddr,0);
++//
++//	pr_debug("%s(): type: %d\n", __func__, skb->pkt_type);
++//#ifdef DEBUG
++//	//print_hex_dump_bytes("xbee_net_rx(): ", DUMP_PREFIX_NONE, skb->data, skb->len);
++//	print_hex_dump_bytes("xbee_net_rx(): ", DUMP_PREFIX_NONE, data, skb->len);
++//#endif
++//
++//	//skb_trim(skb, api_frame->api_data->receive_packet.payload_len - 2); /* We do not put CRC into the frame */
++//
++//	work = kzalloc(sizeof(struct xbee_rx_work), GFP_ATOMIC);
++//	if (!work)
++//	{
++//		kfree_skb(skb);
++//		return;
++//	}
++//
++//	INIT_WORK(&work->work, xbee_rx_worker);
++//	work->skb = skb;
++//	work->xbee_dev = xbee_dev;
++//	memcpy(work->src_addr,api_frame->api_data->receive_packet.src_addr,IEEE802154_ADDR_LEN);
++//
++//	queue_work(xbee_dev->frames_workqueue, &work->work);
++//}
++
++static void
++hm_trp_rx(struct xbee_device *xbee_dev, _api_frame_t *api_frame){
++	/* zbdev->param1 is LQI
++	 * zbdev->param2 is length of data
++	 * zbdev->data is data itself
++	 */
++	struct sk_buff *skb = NULL;
++	unsigned char *data = NULL;
++	struct xbee_rx_work *work;
++
++	skb = alloc_skb(api_frame->api_data->raw_packet.payload_len, GFP_ATOMIC);
++
++	data = skb_put(skb, api_frame->api_data->raw_packet.payload_len);
++	memcpy(data, api_frame->api_data->raw_packet.payload, api_frame->api_data->raw_packet.payload_len);
++
++	pr_debug("%s(): type: %d\n", __func__, skb->pkt_type);
++#ifdef DEBUG
++	print_hex_dump_bytes("hm_trp_net_rx(): ", DUMP_PREFIX_NONE, data, skb->len);
++#endif
++
++	work = kzalloc(sizeof(struct xbee_rx_work), GFP_ATOMIC);
++	if (!work)
++	{
++		kfree_skb(skb);
++		return;
++	}
++
++	INIT_WORK(&work->work, xbee_rx_worker);
++	work->skb = skb;
++	work->xbee_dev = xbee_dev;
++	work->update_lqi = false;							// FIXME: THERE'S still MISSING TO SET SOURCE ADDRESS. IT MUST BE EXTRACTED FROM PACKET
++	work->lqi = api_frame->api_data->raw_packet.lqi;
++	queue_work(xbee_dev->frames_workqueue, &work->work);
++}
++
++static void
++xbee_rx(struct xbee_device *xbee_dev, _api_frame_t *api_frame){
++	/* zbdev->param1 is LQI
++	 * zbdev->param2 is length of data
++	 * zbdev->data is data itself
++	 */
++	struct sk_buff *skb = NULL;
++	unsigned char *data = NULL;
++	struct xbee_rx_work *work;
++
++	skb = alloc_skb(api_frame->api_data->receive_packet.payload_len, GFP_ATOMIC);
++
++	data = skb_put(skb, api_frame->api_data->receive_packet.payload_len);
++	memcpy(data, api_frame->api_data->receive_packet.payload, api_frame->api_data->receive_packet.payload_len);
++
++#ifdef DEBUG
++	//print_hex_dump_bytes("xbee_net_rx(): ", DUMP_PREFIX_NONE, skb->data, skb->len);
++	print_hex_dump_bytes("xbee_net_rx(): ", DUMP_PREFIX_NONE, data, skb->len);
++#endif
++
++	work = kzalloc(sizeof(struct xbee_rx_work), GFP_ATOMIC);
++	if (!work)
++	{
++		kfree_skb(skb);
++		return;
++	}
++
++	INIT_WORK(&work->work, xbee_rx_worker);
++	work->skb = skb;
++	work->xbee_dev = xbee_dev;
++	work->update_lqi = true;
++	memcpy(work->src_addr,api_frame->api_data->receive_packet.src_addr,IEEE802154_ADDR_LEN);
++	queue_work(xbee_dev->frames_workqueue, &work->work);
++}
++
++static void
++ieee802154_net_rx(struct xbee_device *xbee_dev, _api_frame_t *api_frame){
++	int mote_type = UNKNOWN_MOTE;
++	if (NULL == xbee_dev) {
++		printk(KERN_ERR "%s: wrong phy\n", __func__);
++		return;
++	}
++	mote_type = xbee_device_get_type(xbee_dev);
++	switch(mote_type){
++	case XBEE_XB08_DP_MOTE:
++		xbee_rx(xbee_dev,api_frame);
++		break;
++	case HM_TRP_433D_MOTE:
++	case HM_TRP_868D_MOTE:
++		hm_trp_rx(xbee_dev,api_frame);
++		break;
++	default:
++		break;
++	}
++}
++
++/*****************************************************************************
++ * Line discipline interface for IEEE 802.15.4 serial device
++ *****************************************************************************/
++
++static struct ieee802154_ops serial_ops = {
++	.owner = THIS_MODULE,
++	.xmit		= ieee802154_xmit,
++	.ed			= ieee802154_xbee_ed,
++	.set_channel	= ieee802154_xbee_set_channel,
++	.start		= ieee802154_xbee_start,
++	.stop		= ieee802154_xbee_stop,
++	.ieee_addr	= ieee802154_xbee_address,
++};
++
++/*
++ * The "foo" file where a static variable is read from and written to.
++ */
++
++static ssize_t debug_show(struct kobject *kobj, struct kobj_attribute *attr,
++		char *buf) {
++	return sprintf(buf, "%d\n", enable_debug);
++}
++
++static ssize_t debug_store(struct kobject *kobj, struct kobj_attribute *attr,
++		const char *buf, size_t count) {
++	sscanf(buf, "%d", &enable_debug);
++	return count;
++}
++
++static struct kobj_attribute debug_attribute = __ATTR(debug, 0666, debug_show, debug_store);
++
++/*
++ * The "foo" file where a static variable is read from and written to.
++ */
++static ssize_t lqi_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
++	//return sprintf(buf, "%d\n", global_lqi);
++	return xbee_stat_get_lqi_table(buf);
++}
++
++static ssize_t lqi_store(struct kobject *kobj, struct kobj_attribute *attr,
++		const char *buf, size_t count) {
++	return count;
++}
++
++static struct kobj_attribute lqi_attribute = __ATTR(lqi, 0666, lqi_show, lqi_store);
++
++/*
++ * Create a group of attributes so that we can create and destory them all
++ * at once.
++ */
++static struct attribute *attrs[] = {
++		&lqi_attribute.attr,
++		&debug_attribute.attr,
++		NULL , /* need to NULL terminate the list of attributes */
++};
++
++/*
++ * An unnamed attribute group will put all of the attributes directly in
++ * the kobject directory.  If we specify a name, a subdirectory will be
++ * created for the attributes with the directory being the name of the
++ * attribute group.
++ */
++static struct attribute_group attr_group = { .attrs = attrs, };
++
++static struct kobject *xbee_kobj;
++
++/*
++ * Called when a tty is put into ZB line discipline. Called in process context.
++ * Returns 0 on success.
++ */
++static int
++ieee802154_tty_open(struct tty_struct *tty)
++{
++	struct xbee_device *xbee_dev = tty->disc_data;
++	struct ieee802154_dev *dev;
++	int err;
++	int retval;
++
++	pr_debug("Openning ldisc\n");
++	if (!capable(CAP_NET_ADMIN))
++		return -EPERM;
++
++	if (tty->disc_data)
++		return -EBUSY;
++
++	dev = ieee802154_alloc_device(sizeof(*xbee_dev), &serial_ops);
++	if (!dev)
++		return -ENOMEM;
++
++	xbee_dev = dev->priv;
++	xbee_dev->dev = dev;
++
++	xbee_dev->device_driver = UNKNOWN_MOTE;
++
++	xbee_dev->escaped_mode = 1;
++	xbee_dev->frame_id_counter = 1;
++	xbee_dev->recv_state = RECV_STATE_WAIT_START_DELIM;
++
++	mutex_init(&xbee_dev->mutex);
++	init_waitqueue_head(&xbee_dev->wq);
++
++	dev->extra_tx_headroom = 0;
++	/* only 2.4 GHz band */
++	dev->phy->channels_supported[0] = 0x7fff800;
++
++	dev->flags = IEEE802154_HW_OMIT_CKSUM|IEEE802154_HW_AACK;
++
++	dev->parent = tty->dev;
++
++	xbee_dev->tty = tty_kref_get(tty);
++
++	tty->disc_data = xbee_dev;
++	tty->receive_room = MAX_DATA_SIZE;
++
++	/* FIXME: why is this needed. Note don't use ldisc_ref here as the
++	   open path is before the ldisc is referencable */
++
++	if (tty->ldisc->ops->flush_buffer)
++		tty->ldisc->ops->flush_buffer(tty);
++	tty_driver_flush_buffer(tty);
++
++	err = ieee802154_register_device(dev);
++	if (err) {
++		printk(KERN_ERR "%s: device register failed\n", __func__);
++		goto out_free;
++	}
++
++	xbee_dev->frames_workqueue =
++		create_singlethread_workqueue(wpan_phy_name(xbee_dev->dev->phy));
++	if (!xbee_dev->frames_workqueue)
++		goto out_unregister;
++
++	/*
++	 * Create a simple kobject with the name of "kobject_example",
++	 * located under /sys/kernel/
++	 *
++	 * As this is a simple directory, no uevent will be sent to
++	 * userspace.  That is why this function should not be used for
++	 * any type of dynamic kobjects, where the name and number are
++	 * not known ahead of time.
++	 */
++	xbee_kobj = kobject_create_and_add("xbee", kernel_kobj);
++	if (!xbee_kobj)
++		return -ENOMEM;
++
++	/* Create the files associated with this kobject */
++	retval = sysfs_create_group(xbee_kobj, &attr_group);
++	if (retval)
++		kobject_put(xbee_kobj);
++
++	return 0;
++
++out_unregister:
++	ieee802154_unregister_device(xbee_dev->dev);
++
++out_free:
++	destroy_workqueue(xbee_dev->frames_workqueue);
++	tty->disc_data = NULL;
++	tty_kref_put(tty);
++	xbee_dev->tty = NULL;
++
++	ieee802154_free_device(xbee_dev->dev);
++
++	return err;
++}
++
++/*
++ * Called when the tty is put into another line discipline or it hangs up. We
++ * have to wait for any cpu currently executing in any of the other zb_tty_*
++ * routines to finish before we can call zb_tty_close and free the
++ * zb_serial_dev struct. This routine must be called from process context, not
++ * interrupt or softirq context.
++ */
++static void
++ieee802154_tty_close(struct tty_struct *tty)
++{
++	struct xbee_device *xbee_dev;
++
++	xbee_dev = tty->disc_data;
++	if (NULL == xbee_dev) {
++		printk(KERN_WARNING "%s: match is not found\n", __func__);
++		return;
++	}
++
++	flush_workqueue(xbee_dev->frames_workqueue);
++	destroy_workqueue(xbee_dev->frames_workqueue);
++
++	tty->disc_data = NULL;
++	tty_kref_put(tty);
++	xbee_dev->tty = NULL;
++
++	ieee802154_unregister_device(xbee_dev->dev);
++
++	tty_ldisc_flush(tty);
++	tty_driver_flush_buffer(tty);
++
++	ieee802154_free_device(xbee_dev->dev);
++
++	kobject_put(xbee_kobj);
++}
++
++/*
++ * Called on tty hangup in process context.
++ */
++static int
++ieee802154_tty_hangup(struct tty_struct *tty)
++{
++	ieee802154_tty_close(tty);
++	return 0;
++}
++
++/*
++ * Called in process context only. May be re-entered
++ * by multiple ioctl calling threads.
++ */
++static int
++ieee802154_tty_ioctl(struct tty_struct *tty, struct file *file,
++		unsigned int cmd, unsigned long arg)
++{
++	struct xbee_device *xbee_dev;
++
++	pr_debug("cmd = 0x%x\n", cmd);
++
++	xbee_dev = tty->disc_data;
++	if (NULL == xbee_dev) {
++		pr_debug("match is not found\n");
++		return -EINVAL;
++	}
++
++	switch (cmd) {
++	case TCFLSH:
++		return tty_perform_flush(tty, arg);
++	default:
++		/* Try the mode commands */
++		return tty_mode_ioctl(tty, file, cmd, arg);
++	}
++}
++
++
++/*
++ * This can now be called from hard interrupt level as well
++ * as soft interrupt level or mainline.
++ */
++static void
++ieee802154_tty_receive(struct tty_struct *tty, const unsigned char *buf,
++		char *cflags, int count)
++{
++	struct xbee_device *xbee_dev;
++//	int i = 0;
++
++	/* Debug info */
++#ifdef DEBUG
++	printk(KERN_INFO "%s, received %d bytes\n", __func__,
++			count);
++	print_hex_dump_bytes("ieee802154_tty_receive ", DUMP_PREFIX_NONE,
++			buf, count);
++#endif
++
++	/* Actual processing */
++	xbee_dev = tty->disc_data;
++	if (NULL == xbee_dev) {
++		printk(KERN_ERR "%s(): record for tty is not found\n",
++				__func__);
++		return;
++	}
++
++	xbee_receive(xbee_dev,buf,count);
++
++//out:
++	tty_unthrottle(tty);
++}
++
++/*
++ * Line discipline device structure
++ */
++static struct tty_ldisc_ops xbee_ldisc = {
++	.owner  = THIS_MODULE,
++	.magic	= TTY_LDISC_MAGIC,
++	.name	= "ieee802154-ldisc",
++	.open	= ieee802154_tty_open,
++	.close	= ieee802154_tty_close,
++	.hangup	= ieee802154_tty_hangup,
++	.receive_buf = ieee802154_tty_receive,
++	.ioctl	= ieee802154_tty_ioctl,
++};
++
++/*****************************************************************************
++ * Module service routinues
++ *****************************************************************************/
++
++static int __init ieee802154_xbee_init(void)
++{
++	printk(KERN_INFO "Initializing XBee/HM-TRP TTY for Xbee RF 868 OEM and HM-TRP interface\n");
++
++	xbee_stats_init();
++
++	if (tty_register_ldisc(N_IEEE802154, &xbee_ldisc) != 0) {
++		printk(KERN_ERR "%s: line discipline register failed\n",
++				__func__);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static void __exit ieee802154_xbee_cleanup(void)
++{
++	xbee_stats_tini();
++	if (tty_unregister_ldisc(N_IEEE802154) != 0)
++		printk(KERN_CRIT
++			"failed to unregister XBee line discipline.\n");
++}
++
++module_init(ieee802154_xbee_init);
++module_exit(ieee802154_xbee_cleanup);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("João Pedro Taveira");
++MODULE_AUTHOR("Martijn Kuipers");
++MODULE_ALIAS_LDISC(N_IEEE802154);
++
++#endif /* __KERNEL__ */
++
++#ifndef __KERNEL__
++uint8_t ex36esc[] = {0x7E,0x00,0x02,0x23,0x7D,0x31,0xCB};
++uint8_t exTR40esc[] = {0x7E,0x00,0x16,0x10,0x01,0x00,0x7D,0x33,0xA2,0x00,0x40,0x0A,0x01,0x27,0xFF,0xFE,0x00,0x00,0x54,0x78,0x44,0x61,0x74,0x61,0x30,0x41,0x7D,0x33};
++
++uint8_t ex36escexTR40esc[] = {0x7E,0x00,0x02,0x23,0x7D,0x31,0xCB,0x7E,0x00,0x16,0x10,0x01,0x00,0x7D,0x33,0xA2,0x00,0x40,0x0A,0x01,0x27,0xFF,0xFE,0x00,0x00,0x54,0x78,0x44,0x61,0x74,0x61,0x30,0x41,0x7D,0x33};
++
++uint8_t exTR40escError[] = {0x7E,0x00,0x16,0x10,0x01,0x00,0x7D,0x33,0x7E,0x00,0x02,0x23,0x7D,0x31,0xCB,0xA2,0x00,0x40,0x0A,0x01,0x27,0xFF,0xFE,0x00,0x00,0x54,0x78,0x44,0x61,0x74,0x61,0x30,0x41,0x7D,0x33,0x7E,0x00,0x16,0x10,0x01,0x00,0x7D,0x33,0xA2,0x00,0x40,0x0A,0x01,0x27,0xFF,0xFE,0x00,0x00,0x54,0x78,0x44,0x61,0x74,0x61,0x30,0x41,0x7D,0x33};
++
++uint8_t teste2[] = {0x7E,0x00,0x08,0x08,0x03,0x42,0x44,0xAA,0xBB,0xCC,0xDD,0x60};
++
++uint8_t receive_packet[] = {0x7E,0x00,0x13,0x90,0x00,0x00,0x13,0xA2,0x00,0x40,0x52,0x2B,0xAA,0xFF,0xFE,0x01,0x52,0x78,0x44,0x61,0x74,0x61,0x11};
++
++uint8_t at_cmd_response_BD[] = {0x7E,0x00,0x05,0x88,0x01,0x42,0x44,0x00,0xF0};
++
++uint8_t at_cmd_response_SH[] = {0x7E,0x00,0x09,0x88,0x02,0x53,0x48,0x00,0xAA,0xBB,0xCC,0xDD,0xCC};
++uint8_t at_cmd_response_SL[] = {0x7E,0x00,0x09,0x88,0x03,0x53,0x4C,0x00,0x11,0x22,0x33,0x44,0x2B};
++
++uint8_t modem_status_hw_reset[] = {0x7E,0x00,0x02,0x8A,0x00,0x75};
++uint8_t modem_status_timer_reset[] = {0x7E,0x00,0x02,0x8A,0x01,0x74};
++uint8_t modem_status_net_woke_up[] = {0x7E,0x00,0x02,0x8A,0x0B,0x6A};
++uint8_t modem_status_net_went2sleep[] = {0x7E,0x00,0x02,0x8A,0x0C,0x69};
++
++uint8_t transmit_status[] = {0x7E,0x00,0x07,0x8B,0x47,0xFF,0xFE,0x00,0x00,0x02,0x2E};
++
++//uint8_t transmit_status2[] = {0x7E,0x00,0x07,0x8B,0x01,0xFF,0xFE,0x00,0x00,0x00,0x76};
++
++uint8_t remote_at_command_resp[] = {0x7E,0x00,0x13,0x97,0x55,0x00,0x13,0xA2,0x00,0x40,0x52,0x2B,0xAA,0xFF,0xFE,0x53,0x4C,0x00,0x40,0x52,0x2B,0xAA,0xF4};
++
++uint8_t node_id_indicator[] = {
++		0x7E,
++		0x00,0x1A,
++		0x95, //1
++		0x00,0x13,0xA2,0x00,0x40,0x52,0x2B,0xAA, // 8
++		0x7D,0x7D^0x20,0x84, // 2
++		0x02, // 1
++		0x7D,0x7D^0x20,0x84, // 2
++		0x00,0x13,0xA2,0x00,0x40,0x52,0x2B,0xAA, // 8
++		0x20,0x00, // 2
++		0xFF,0xFE, // 2
++		0x11};
++
++uint8_t explicit_rx_indicator[] = {
++	0x7E,
++	0x00,0x18,
++	0x91,
++	0x00,0x13,0xA2,0x00,0x40,0x52,0x2B,0xAA, // 8
++	0xFF,0xFE,
++	0xE0,
++	0xE0,
++	0x22,0x11,
++	0xC1,0x05,
++	0x02,
++	0x52,0x78,0x44,0x61,0x74,0x61,
++	0x56
++};
++
++
++/*
++ * xbee rx thread
++ */
++
++void xbee_rx_sighandler(int sig){
++	printk(KERN_DEBUG "%s(): signal caught\n",__func__);
++}
++
++void xbee_rx_setup_signals(){
++	printk(KERN_DEBUG "%s(): called\n",__func__);
++	struct sigaction act;
++	act.sa_handler = xbee_rx_sighandler;
++	act.sa_flags = 0;
++	sigemptyset(&act.sa_mask);
++	sigaddset(&act.sa_mask, SIGINT);
++	sigaddset(&act.sa_mask, SIGQUIT);
++	sigaddset(&act.sa_mask, SIGTERM);
++	sigaction(SIGINT,&act,NULL);
++	sigaction(SIGQUIT,&act,NULL);
++	sigaction(SIGTERM,&act,NULL);
++
++	struct sigaction act_pipe;
++	act_pipe.sa_handler = xbee_rx_sighandler;
++	act_pipe.sa_flags = 0;
++	sigemptyset(&act_pipe.sa_mask);
++	sigaddset(&act_pipe.sa_mask, SIGPIPE);
++	sigaction(SIGPIPE,&act_pipe,NULL);
++}
++
++static void
++dump_hex(uint8_t *buf, int len)
++{
++	int i = 0;
++	uint8_t raw_byte = 0;
++	unsigned char *data = (unsigned char *) buf;
++	for(i = 0;i<len;i++){
++		raw_byte = ((unsigned char)*(data+i));
++		printf("%02X ",raw_byte);
++	}
++	printf("\n");
++}
++
++#define XBEE_MAX_RX_LEN 256
++static void *
++xbee_rx_thread(void *data)
++{
++	int recv_len = 0;
++	uint8_t rx_buffer[XBEE_MAX_RX_LEN] = {};
++
++	int running = 1;
++	int end = 0;
++	struct xbee_device *xbee_dev = (struct xbee_device *) data;
++	xbee_rx_setup_signals();
++	printk(KERN_DEBUG "%s(): begin\n", __func__);
++	pthread_mutex_lock(&xbee_dev->mutex);
++	running = xbee_dev->rx_thread_running = 1;
++	end = xbee_dev->rx_thread_end;
++	pthread_mutex_unlock(&xbee_dev->mutex);
++
++	while(running && !end)
++	{
++		fd_set fds;
++		FD_ZERO(&fds);
++		FD_SET(xbee_dev->tty_fd,&fds);
++		struct timeval tv = {1,0};
++		switch(select(xbee_dev->tty_fd+1,&fds,NULL,NULL,&tv)){
++		case 0:
++			printk(KERN_DEBUG "%s: timeout.. waiting again\n",__func__);
++			break;
++		case -1:
++			printk(KERN_ERR "%s(): some error occur in select: %s\n",__func__,strerror(errno));
++			break;
++		default:
++			if(FD_ISSET(xbee_dev->tty_fd,&fds)){
++				recv_len = read(xbee_dev->tty_fd,rx_buffer,XBEE_MAX_RX_LEN);
++				printk(KERN_DEBUG "%s: some activity in tty: %d bytes read\n",__func__,recv_len);
++				dump_hex(rx_buffer, recv_len);
++				xbee_receive(xbee_dev,rx_buffer,recv_len);
++			}
++		}
++		pthread_mutex_lock(&xbee_dev->mutex);
++		running = xbee_dev->rx_thread_running;
++		end = xbee_dev->rx_thread_end;
++		pthread_mutex_unlock(&xbee_dev->mutex);
++	}
++
++	printk(KERN_DEBUG "%s: end\n", __func__);
++	pthread_exit(NULL);
++	return NULL;
++}
++
++static int
++xbee_start_rx_thread(struct xbee_device *xbee_dev){
++	pthread_attr_t attr;
++	pthread_attr_init(&attr);
++	if(xbee_dev == NULL){
++		printk(KERN_ERR "%s(): dev is NULL\n",__func__);
++		return -1;
++	}
++	xbee_rx_setup_signals();
++	printk(KERN_DEBUG "%s(): starting thread\n",__func__);
++	pthread_mutex_lock(&xbee_dev->mutex);
++	if(!xbee_dev->rx_thread_running){
++		xbee_dev->rx_thread_running = 1;
++		xbee_dev->rx_thread_end = 0;
++		if(pthread_create(&xbee_dev->rx_thread_tid,&attr,xbee_rx_thread,xbee_dev)!= 0) {
++			pthread_mutex_unlock(&xbee_dev->mutex);
++			printk(KERN_ERR "%s(): error launching thread\n",__func__);
++			return -1;
++		}
++		printk(KERN_DEBUG "%s(): thread started\n",__func__);
++	} else {
++		printk(KERN_WARNING "%s(): thread already running\n",__func__);
++	}
++	pthread_mutex_unlock(&xbee_dev->mutex);
++	return 1;
++}
++
++static int
++xbee_stop_rx_thread(struct xbee_device *xbee_dev){
++	if(xbee_dev == NULL){
++		printk(KERN_ERR "%s(): dev is NULL\n",__func__);
++		return -1;
++	}
++	pthread_mutex_lock(&xbee_dev->mutex);
++	xbee_dev->rx_thread_running = 0;
++	xbee_dev->rx_thread_end = 1;
++	pthread_mutex_unlock(&xbee_dev->mutex);
++	printk(KERN_DEBUG "%s(): waiting for rx thread to end\n",__func__);
++	pthread_join(xbee_dev->rx_thread_tid, NULL);
++	printk(KERN_DEBUG "%s(): rx thread ended\n",__func__);
++	return 1;
++}
++
++#endif /* !__KERNEL__ */
++
++#ifndef __KERNEL__
++int main(int argc, char *argv[]){
++	int ret = 0;
++	_api_frame_t *api_frame = NULL;
++	struct xbee_device *xbee_dev = xbee_device_new();
++
++	if(argc > 2)
++	{
++		xbee_dev->tty_path = argv[1];
++	}
++	else
++	{
++		printk(KERN_ERR "Usage: %s <tty device> <receive>|<send>\n",argv[0]);
++		return 1;
++	}
++
++	if(xbee_device_init(xbee_dev) < 0)
++	{
++		printk(KERN_ERR "%s(): error in init\n",__func__);
++		return 1;
++	}
++
++	xbee_start_rx_thread(xbee_dev);
++
++	if(!strcmp("send_TR",argv[2])){
++		//uint8_t addr[XBEE_ADDR_LEN] = {0x00,0x13,0xA2,0x00,0x40,0x0A,0x01,0x27};
++		//uint8_t addr[XBEE_ADDR_LEN] = {0x00,0x13,0xA2,0x00,0x40,0x8B,0xBA,0xCD};
++		//13:A2:00:40:8B:BA:CD:FF
++		uint8_t addr[XBEE_ADDR_LEN] = {0x00,0x00,0x00,0x00,0x00,0x00,0xFF,0xFF};
++		uint8_t payload[8] = {'T','x','D','a','t','a','0','A'};
++
++		xbee_dev->frame_id_counter = 0x01;
++		api_frame = _api_frame_new_transmit_request(xbee_dev,addr,0x00,payload,8);
++		_api_frame_print(api_frame);
++
++		ret = xbee_send(xbee_dev,api_frame);
++		printk(KERN_DEBUG "%s: xbee_send ret: %d\n", __func__,ret);
++
++		_api_frame_free(api_frame);
++
++	} else if(!strcmp("send_ATAP1",argv[2])){
++			xbee_dev->frame_id_counter = 0x01;
++			api_frame = _api_frame_new_at_command_u8(xbee_dev,"AP",0);
++			_api_frame_print(api_frame);
++
++			ret = xbee_send(xbee_dev,api_frame);
++			printk(KERN_DEBUG "%s: xbee_send ret: %d\n", __func__,ret);
++
++			_api_frame_free(api_frame);
++	} else if(!strcmp("addr",argv[2])){
++		uint8_t addr[XBEE_ADDR_LEN] = {};
++		xbee_ieee_address(xbee_dev,addr);
++	} else if(!strcmp("receive",argv[2])){
++		sleep(7);
++	}
++
++	xbee_stop_rx_thread(xbee_dev);
++
++//	xbee_receive(xbee_dev,exTR40esc,sizeof(exTR40esc));
++//
++//	xbee_receive(xbee_dev,teste2,sizeof(teste2));
++//
++//	xbee_receive(xbee_dev,at_cmd_response_BD,sizeof(at_cmd_response_BD));
++//
++//	xbee_receive(xbee_dev,at_cmd_response_SH,sizeof(at_cmd_response_SH));
++//	xbee_receive(xbee_dev,at_cmd_response_SL,sizeof(at_cmd_response_SL));
++//
++//	xbee_receive(xbee_dev,modem_status_hw_reset,sizeof(modem_status_hw_reset));
++//	xbee_receive(xbee_dev,modem_status_timer_reset,sizeof(modem_status_timer_reset));
++//	xbee_receive(xbee_dev,modem_status_net_woke_up,sizeof(modem_status_net_woke_up));
++//	xbee_receive(xbee_dev,modem_status_net_went2sleep,sizeof(modem_status_net_went2sleep));
++//
++//	xbee_receive(xbee_dev,transmit_status2,sizeof(transmit_status2));
++//
++//	xbee_receive(xbee_dev,node_id_indicator,sizeof(node_id_indicator));
++//
++//	xbee_receive(xbee_dev,receive_packet,sizeof(receive_packet));
++//	xbee_receive(xbee_dev,explicit_rx_indicator,sizeof(explicit_rx_indicator));
++
++//	uint8_t somecommand1[] = {0x7E ,0x00 ,0x16 ,0x10 ,0x01 ,0x00 ,0x13 ,0xA2 ,0x00 ,0x40 ,0x0A ,0x01 ,0x27 ,0xFF ,0xFE ,0x00 ,0x00 ,0x54 ,0x78 ,0x44 ,0x61 ,0x74 ,0x61 ,0x30 ,0x41 ,0x13 };
++//	uint8_t somecommand[] = {0x7D, 0x5E ,0x00 ,0x16 ,0x10 ,0x01 ,0x00 ,0x7D, 0x33 ,0xA2 ,0x00 ,0x40 ,0x0A ,0x01 ,0x27 ,0xFF ,0xFE ,0x00 ,0x00 ,0x54 ,0x78 ,0x44 ,0x61 ,0x74 ,0x61 ,0x30 ,0x41 ,0x7D, 0x33 };
++
++//	xbee_dev->escaped_mode = 0;
++//	xbee_receive(xbee_dev,somecommand1,sizeof(somecommand1));
++
++//	xbee_dev->escaped_mode = 1;
++//	xbee_receive(xbee_dev,somecommand,sizeof(somecommand));
++
++//	api_frame = _api_frame_new_at_command(xbee_dev,"NH");
++//	_api_frame_print(api_frame);
++//	_api_frame_free(api_frame);
++//
++//	api_frame = _api_frame_new_at_command_u8(xbee_dev,"BD",0x10);
++//	_api_frame_print(api_frame);
++//	_api_frame_free(api_frame);
++//
++//	uint8_t args[4] = {0xAA,0xBB,0xCC,0xDD};
++//	api_frame = _api_frame_new_at_command_u32(xbee_dev,"BD",args);
++//	_api_frame_print(api_frame);
++//	_api_frame_free(api_frame);
++//
++//	uint8_t addr[XBEE_ADDR_LEN] = {0x00,0x13,0xA2,0x00,0x40,0x0A,0x01,0x27};
++//	uint8_t payload[8] = {'T','x','D','a','t','a','0','A'};
++//
++//	xbee_dev->frame_id_counter = 0x01;
++//	api_frame = _api_frame_new_transmit_request(xbee_dev,addr,0x00,payload,8);
++//	_api_frame_print(api_frame);
++//
++//	ret = xbee_send(xbee_dev,api_frame);
++//	printk(KERN_DEBUG "%s: xbee_send ret: %d\n", __func__,ret);
++
++//	uint16_t len = 0;
++//	uint8_t *raw_frame = _api_frame_to_raw(api_frame,&len);
++//	int i = 0;
++//	uint8_t raw_byte = 0;
++//	printf("Dump: uint8_t somecommand[] = {");
++//	unsigned char *data = (unsigned char *) raw_frame;
++//	for(i = 0;i<len;i++){
++//		if(i)
++//			printf(",");
++//		raw_byte = ((unsigned char)*(raw_frame+i));
++//		if(xbee_dev->escaped_mode && escape_required(raw_byte))
++//		{
++//			printf("0x%02X, ",XBEE_ESCAPE);
++//			raw_byte = raw_byte^0x20;
++//		}
++//		printf("0x%02X ",raw_byte);
++//	}
++//	printf("};\n");
++//	if(raw_frame) free(raw_frame);
++//	_api_frame_free(api_frame);
++
++	xbee_device_release(xbee_dev);
++	return 0;
++}
++
++#endif /* !__KERNEL__ */
+diff --git a/include/uapi/linux/tty.h b/include/uapi/linux/tty.h
+index dac199a..96233b1 100644
+--- a/include/uapi/linux/tty.h
++++ b/include/uapi/linux/tty.h
+@@ -34,5 +34,6 @@
+ #define N_TI_WL		22	/* for TI's WL BT, FM, GPS combo chips */
+ #define N_TRACESINK	23	/* Trace data routing for MIPI P1149.7 */
+ #define N_TRACEROUTER	24	/* Trace data routing for MIPI P1149.7 */
++#define N_IEEE802154	25	/* Serial / USB serial IEEE802154.4 devices */
+ 
+ #endif /* _UAPI_LINUX_TTY_H */
+-- 
+1.8.3.2
+

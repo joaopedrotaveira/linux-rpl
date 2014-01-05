@@ -1,0 +1,24 @@
+From 65695d81357b068afaf589d258bf5f2e58974a75 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jo=C3=A3o=20Pedro=20Taveira?= <joao.p.taveira@gmail.com>
+Date: Sun, 5 Jan 2014 16:53:49 +0000
+Subject: [PATCH 4/4] Fixed incomplete type of struct in6_addr
+
+---
+ net/ipv6/rpl/nl_policy.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/net/ipv6/rpl/nl_policy.c b/net/ipv6/rpl/nl_policy.c
+index cebcfba..b2a58b3 100644
+--- a/net/ipv6/rpl/nl_policy.c
++++ b/net/ipv6/rpl/nl_policy.c
+@@ -17,6 +17,7 @@
+ #include <linux/kernel.h>
+ #include <net/netlink.h>
+ #include <linux/rpl_nl.h>
++#include <linux/in6.h>
+ 
+ #define NLA_RPL_RANK NLA_U16
+ 
+-- 
+1.8.3.2
+

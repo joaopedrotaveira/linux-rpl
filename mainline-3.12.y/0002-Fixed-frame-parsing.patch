@@ -1,0 +1,76 @@
+From 1c1ae0c1ab866896a5910802871d0de12d8d88d3 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jo=C3=A3o=20Pedro=20Taveira?= <joao.p.taveira@gmail.com>
+Date: Sun, 5 Jan 2014 16:14:33 +0000
+Subject: [PATCH 2/4] Fixed frame parsing
+
+---
+ net/ieee802154/6lowpan.c | 33 +++++++++++++++++++++++++++------
+ 1 file changed, 27 insertions(+), 6 deletions(-)
+
+diff --git a/net/ieee802154/6lowpan.c b/net/ieee802154/6lowpan.c
+index ff41b4d..6e6d0be 100644
+--- a/net/ieee802154/6lowpan.c
++++ b/net/ieee802154/6lowpan.c
+@@ -879,16 +879,26 @@ lowpan_process_data(struct sk_buff *skb)
+ 			pr_debug("%s first fragment received for tag %d, "
+ 				 "begin packet reassembly", __func__, tag);
+ 			frame = lowpan_alloc_new_frame(skb, len, tag);
+-			if (!frame)
++			if (!frame){
++				pr_debug("%s first fragment received for tag %d, "
++					 "failed to allow new frame!! len: %d", __func__, tag,len);
+ 				goto unlock_and_drop;
++			}
+ 		}
+ 
+ 		/* if payload fits buffer, copy it */
+ 		if (likely((offset * 8 + skb->len) <= frame->length))
+ 			skb_copy_to_linear_data_offset(frame->skb, offset * 8,
+ 							skb->data, skb->len);
+-		else
++		else {
++			pr_debug("%s it doesnt fit: offset: %d skb->len: %d frame->length: %d"
++				 "(tag %d)", __func__, offset,skb->len,frame->length, tag);
++
+ 			goto unlock_and_drop;
++		}
++
++		pr_debug("%s assembling: bytes_rcv: %d/%d len: %d"
++			 "(tag %d)", __func__, frame->bytes_rcv,frame->length, skb->len, tag);
+ 
+ 		frame->bytes_rcv += skb->len;
+ 
+@@ -1104,15 +1114,26 @@ static int lowpan_set_address(struct net_device *dev, void *p)
+ 	return 0;
+ }
+ 
++//static int lowpan_get_mac_header_length(struct sk_buff *skb)
++//{
++//	/*
++//	 * Currently long addressing mode is supported only, so the overall
++//	 * header size is 21:
++//	 * FC SeqNum DPAN DA  SA  Sec
++//	 * 2  +  1  +  2 + 8 + 8 + 0  = 21
++//	 */
++//	return 21;
++//}
++
+ static int lowpan_get_mac_header_length(struct sk_buff *skb)
+ {
+ 	/*
+-	 * Currently long addressing mode is supported only, so the overall
++	 * Currently long addressing mode is supported only, so the overall //FIXME
+ 	 * header size is 21:
+-	 * FC SeqNum DPAN DA  SA  Sec
+-	 * 2  +  1  +  2 + 8 + 8 + 0  = 21
++	 * FC SeqNum DPAN DA  SPAN SA  Sec
++	 * 2  +  1  +  2 + 8 + 2 + 8 + 0  = 23
+ 	 */
+-	return 21;
++	return 23;
+ }
+ 
+ static int
+-- 
+1.8.3.2
+
